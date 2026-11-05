@@ -179,6 +179,31 @@ static const uint8_t  TMC_TPOWERDOWN      = 20;      // standstill -> IHOLD afte
 static const uint32_t TMC_TCOOLTHRS       = 0;
 static const uint8_t  TMC_SGTHRS          = 0;
 
+// -------------------- IMU (MPU6050 via Adafruit_MPU6050) --------------------
+// Library choice: Adafruit_MPU6050, not the jrowberg DMP. With no
+// magnetometer the DMP's yaw is also pure gyro integration (same drift), so
+// it adds nothing for pan tracking but costs a firmware blob upload at every
+// boot and FIFO handling, and INT is not wired on this PCB.
+// MOUNTING ASSUMPTION: GY-521 flat, +Z up, +X toward the bow. Change the
+// axis mapping in ImuTask() if it is mounted otherwise.
+static const uint16_t IMU_PERIOD_MS          = 10;     // 100 Hz
+static const uint16_t IMU_CAL_SAMPLES        = 100;    // 1 s gyro-bias average at boot (keep still)
+static const float    IMU_COMP_ALPHA         = 0.98f;  // complementary filter: gyro weight
+static const uint32_t IMU_I2C_CLOCK_HZ       = 400000;
+static const uint32_t IMU_TASK_STACK         = 4096;
+static const UBaseType_t IMU_TASK_PRIO       = 2;      // above loopTask (1) on core 1
+
+// -------------------- PAN TRACKING (SCAFFOLD, OFF BY DEFAULT) --------------------
+// A 6-DOF IMU has NO true heading (no magnetometer). Tracking holds the
+// light pointed at a fixed WORLD direction by integrating the yaw rate, which
+// drifts (gyro bias). Re-zero with a MODE long-press. Bench-test before use.
+static constexpr float PAN_TRAVEL_DEG             = 180.0f;  // LR_STEP_LIMIT spans this (<= 180)
+static const float    PAN_STEPS_PER_DEG          = (float)LR_STEP_LIMIT / PAN_TRAVEL_DEG;
+static const float    PAN_TRACK_SIGN             = 1.0f;    // flip to -1 if tracking turns the wrong way
+static const long     PAN_TRACK_DEADBAND_STEPS   = 18;      // ~0.5 deg: no hunting on noise
+static const uint16_t MODE_LONG_PRESS_MS         = 1000;    // MODE held this long = re-zero heading
+static_assert(PAN_TRAVEL_DEG <= 180.0f, "pan travel must stay <= 180 degrees");
+
 // -------------------- TASKS / SCHEDULING --------------------
 // LED show() blocks ~24 ms for 600 RGBW pixels, so steppers run in their own
 // task on core 0; loop() (core 1) only exchanges commands with it.
@@ -497,6 +522,37 @@ static long    g_testJogOriginUD = 0;
 // -------------------- LIGHT-BAR PWM --------------------
 static uint8_t g_lightBarDuty = 0;   // last duty written to PIN_PWM_DATA
 
+// -------------------- IMU ESTIMATE (IMU task -> loop) --------------------
+struct ImuEstimate {
+  bool     present;      // imu.begin() succeeded
+  bool     calibrated;   // gyro bias measured
+  float    rollDeg;      // complementary filter
+  float    pitchDeg;     // complementary filter
+  float    yawDeg;       // integrated yaw since boot (drifts; NOT a compass heading)
+  float    yawRateDps;   // tilt-compensated yaw rate
+  float    ax, ay, az;   // m/s^2
+  float    gx, gy, gz;   // rad/s, bias removed
+  float    tempC;
+  uint32_t samples;
+  uint32_t readErrors;
+};
+static portMUX_TYPE g_imuMux = portMUX_INITIALIZER_UNLOCKED;
+static ImuEstimate  g_imu = { false, false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+static float        g_yawZeroDeg = 0.0f;  // loop-side offset; heading = yawDeg - g_yawZeroDeg
+
+// -------------------- PAN TRACKING STATE --------------------
+enum PanMode : uint8_t { PAN_MODE_MANUAL = 0, PAN_MODE_TRACK };
+static bool    g_panTrackEnabled = false;   // OFF until bench-tested ('t' toggles)
+static PanMode g_panMode         = PAN_MODE_MANUAL;
+static bool    g_trackNeedAnchor = true;    // re-anchor after enable / manual move / re-zero
+static long    g_trackAnchorPos  = 0;
+static float   g_trackAnchorYaw  = 0.0f;
+static long    g_trackTarget     = 0;
+
+// -------------------- MODE BUTTON --------------------
+static bool g_modeLongPressEdge = false;    // one-shot: MODE held >= MODE_LONG_PRESS_MS
+static bool g_modeLongFired     = false;    // long press already fired during this hold
+
 // -------------------- FRAME SCHEDULER --------------------
 static uint32_t g_lastFrameMs = 0;
 
@@ -768,7 +824,8 @@ static bool IsHeld(const DebouncedButton &b) {
 
 // Button map (J6, no extra hardware):
 //   BRIGHTNESS click (press+release, no chord)  -> next brightness level
-//   MODE press                                  -> next lighting mode
+//   MODE click (released before 1 s)            -> next lighting mode
+//   MODE held >= MODE_LONG_PRESS_MS             -> re-zero tracking heading
 //   LEFT / RIGHT held                           -> pan jog (+ turn overlay)
 //   BRIGHTNESS held + LEFT held                 -> lift DOWN
 //   BRIGHTNESS held + RIGHT held                -> lift UP
@@ -784,7 +841,18 @@ static void UpdateInputs(uint32_t nowMs) {
 
   const bool brightPressed  = ConsumePressedEdge(btnBrightness);
   const bool brightReleased = ConsumeReleasedEdge(btnBrightness);
-  g_modePressedEdge         = ConsumePressedEdge(btnMode);
+
+  // ---- MODE: click on release (< long press), long press fires once while held ----
+  const bool modePressed  = ConsumePressedEdge(btnMode);
+  const bool modeReleased = ConsumeReleasedEdge(btnMode);
+  if (modePressed) g_modeLongFired = false;
+  g_modeLongPressEdge = false;
+  if (IsHeld(btnMode) && !g_modeLongFired &&
+      (nowMs - btnMode.pressedAtMs) >= MODE_LONG_PRESS_MS) {
+    g_modeLongFired = true;
+    g_modeLongPressEdge = true;
+  }
+  g_modePressedEdge = modeReleased && !g_modeLongFired;
 
   const bool brightHeld = IsHeld(btnBrightness);
   const bool leftHeld   = IsHeld(btnTurnLeft);
@@ -1048,6 +1116,118 @@ static void ApplyTurnHazardOverlay(uint32_t nowMs) {
 // ============================================================================
 
 
+
+
+
+
+// ============================================================================
+// IMU (MPU6050) READ + COMPLEMENTARY FILTER
+// ============================================================================
+//
+// ImuTask() runs at 100 Hz on core 1 (priority above loop) and is the ONLY
+// user of Wire/imu after setup(). It publishes an ImuEstimate under
+// g_imuMux; everything else reads it with ReadImu().
+//
+//  - Gyro bias: mean of the first IMU_CAL_SAMPLES samples (keep still ~1 s).
+//  - Roll/pitch: complementary filter (gyro integration + accel gravity).
+//  - Yaw: integral of the tilt-compensated yaw rate
+//        yawRate = (gy*sin(roll) + gz*cos(roll)) / cos(pitch)
+//    This is a RELATIVE heading that drifts with residual gyro bias. A 6-DOF
+//    IMU cannot give true heading. Re-zero with a MODE long-press.
+// ============================================================================
+
+static const float RAD2DEG = 57.2957795f;
+
+static void ReadImu(ImuEstimate &out) {
+  portENTER_CRITICAL(&g_imuMux);
+  out = g_imu;
+  portEXIT_CRITICAL(&g_imuMux);
+}
+
+static float ImuHeadingDeg(const ImuEstimate &e) {
+  return e.yawDeg - g_yawZeroDeg;
+}
+
+static void ImuTask(void * /*arg*/) {
+  float biasX = 0.0f, biasY = 0.0f, biasZ = 0.0f;
+  uint16_t calCount = 0;
+  float roll = 0.0f, pitch = 0.0f, yaw = 0.0f;
+  bool seeded = false;
+  uint32_t lastUs = micros();
+  TickType_t lastWake = xTaskGetTickCount();
+
+  for (;;) {
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(IMU_PERIOD_MS));
+
+    sensors_event_t a, g, t;
+    const bool ok = imu.getEvent(&a, &g, &t);
+    const uint32_t nowUs = micros();
+    float dt = (float)(nowUs - lastUs) * 1e-6f;
+    lastUs = nowUs;
+
+    if (!ok) {
+      portENTER_CRITICAL(&g_imuMux);
+      g_imu.readErrors++;
+      portEXIT_CRITICAL(&g_imuMux);
+      continue;
+    }
+    if (dt <= 0.0f || dt > 0.1f) dt = (float)IMU_PERIOD_MS * 1e-3f;
+
+    // ---- Gyro bias calibration (first second) ----
+    if (calCount < IMU_CAL_SAMPLES) {
+      biasX += g.gyro.x;  biasY += g.gyro.y;  biasZ += g.gyro.z;
+      calCount++;
+      if (calCount == IMU_CAL_SAMPLES) {
+        biasX /= (float)IMU_CAL_SAMPLES;
+        biasY /= (float)IMU_CAL_SAMPLES;
+        biasZ /= (float)IMU_CAL_SAMPLES;
+      }
+      continue;
+    }
+
+    const float ax = a.acceleration.x, ay = a.acceleration.y, az = a.acceleration.z;
+    const float gx = g.gyro.x - biasX, gy = g.gyro.y - biasY, gz = g.gyro.z - biasZ;
+
+    // ---- Roll / pitch: complementary filter ----
+    const float rollAcc  = atan2f(ay, az) * RAD2DEG;
+    const float pitchAcc = atan2f(-ax, sqrtf(ay * ay + az * az)) * RAD2DEG;
+    if (!seeded) {
+      roll = rollAcc;
+      pitch = pitchAcc;
+      seeded = true;
+    }
+    roll  = IMU_COMP_ALPHA * (roll  + gx * dt * RAD2DEG) + (1.0f - IMU_COMP_ALPHA) * rollAcc;
+    pitch = IMU_COMP_ALPHA * (pitch + gy * dt * RAD2DEG) + (1.0f - IMU_COMP_ALPHA) * pitchAcc;
+
+    // ---- Yaw: tilt-compensated rate, integrated (relative, drifts) ----
+    const float rollRad = roll / RAD2DEG;
+    float cosPitch = cosf(pitch / RAD2DEG);
+    if (cosPitch < 0.2f) cosPitch = 0.2f;   // avoid blow-up near +/-90 deg pitch
+    const float yawRate = (gy * sinf(rollRad) + gz * cosf(rollRad)) / cosPitch;  // rad/s
+    yaw += yawRate * dt * RAD2DEG;
+
+    portENTER_CRITICAL(&g_imuMux);
+    g_imu.calibrated = true;
+    g_imu.rollDeg    = roll;
+    g_imu.pitchDeg   = pitch;
+    g_imu.yawDeg     = yaw;
+    g_imu.yawRateDps = yawRate * RAD2DEG;
+    g_imu.ax = ax;  g_imu.ay = ay;  g_imu.az = az;
+    g_imu.gx = gx;  g_imu.gy = gy;  g_imu.gz = gz;
+    g_imu.tempC = t.temperature;
+    g_imu.samples++;
+    portEXIT_CRITICAL(&g_imuMux);
+  }
+}
+
+static void StartImuTask() {
+  xTaskCreatePinnedToCore(ImuTask, "imu", IMU_TASK_STACK, nullptr,
+                          IMU_TASK_PRIO, nullptr, 1 /* core 1 */);
+}
+
+// ============================================================================
+// END OF IMU
+// ============================================================================
 
 
 
@@ -1358,6 +1538,43 @@ static void TestJogTargets(const AxisFeedback &lr, const AxisFeedback &ud, long 
   }
 }
 
+// -------------------- PAN_MODE_TRACK (scaffold, off by default) --------------------
+// Holds the pan pointed at a fixed WORLD direction using the IMU's integrated
+// yaw (relative, drift-limited -- not a compass). Manual LEFT/RIGHT always
+// overrides while held; on release tracking waits for the axis to stop, then
+// re-anchors at the new position. Targets are clamped to the pan soft limits
+// here and again in the engine.
+static bool UpdatePanTracking(const AxisFeedback &lr, bool manualActive, long &target) {
+  g_panMode = PAN_MODE_MANUAL;
+  if (!g_panTrackEnabled || !g_drvLR.enabled) {
+    g_trackNeedAnchor = true;
+    return false;
+  }
+  ImuEstimate est;
+  ReadImu(est);
+  if (!est.calibrated || manualActive) {
+    g_trackNeedAnchor = true;          // manual wins; re-anchor after release
+    return false;
+  }
+  if (g_trackNeedAnchor) {
+    if (lr.running) return false;      // let the manual move finish (engine HOLD = decel)
+    g_trackAnchorPos  = lr.position;
+    g_trackAnchorYaw  = ImuHeadingDeg(est);
+    g_trackTarget     = lr.position;
+    g_trackNeedAnchor = false;
+  }
+
+  // Boat yaws +d degrees -> pan by -d degrees to hold the world direction.
+  const float dYaw = ImuHeadingDeg(est) - g_trackAnchorYaw;
+  long t = g_trackAnchorPos - lroundf(PAN_TRACK_SIGN * dYaw * PAN_STEPS_PER_DEG);
+  t = ClampLong(t, 0, LR_STEP_LIMIT);
+  if (labs(t - g_trackTarget) >= PAN_TRACK_DEADBAND_STEPS) g_trackTarget = t;
+
+  g_panMode = PAN_MODE_TRACK;
+  target = g_trackTarget;
+  return true;
+}
+
 // Call every loop(): decide commands from inputs; the engine enforces limits.
 static void UpdateSteppersJog() {
   AxisFeedback lr, ud;
@@ -1382,6 +1599,15 @@ static void UpdateSteppersJog() {
   const bool liftJog = (g_liftUpHeld != g_liftDownHeld);
   if (liftJog) {
     udMode = g_liftUpHeld ? AXIS_JOG_POS : AXIS_JOG_NEG;
+  }
+
+  // ---------------- Pan tracking (only when no manual pan) ----------------
+  if (g_testJogPhase == 0) {
+    long trackTarget = 0;
+    if (UpdatePanTracking(lr, panJog || g_turnLeftHeld || g_turnRightHeld, trackTarget)) {
+      lrMode = AXIS_GOTO;
+      lrTarget = trackTarget;
+    }
   }
 
   // ---------------- Console test move ----------------
@@ -1428,7 +1654,8 @@ static void ConsoleHelp() {
   Serial.println(F("e          toggle driver EN (only drivers whose UART config verified)"));
   Serial.println(F("d          dump test_connection + DRV_STATUS for both drivers"));
   Serial.println(F("s          short out-and-back jog on each axis (within soft limits)"));
-  Serial.println(F("i          print IMU"));
+  Serial.println(F("i          print IMU (filtered roll/pitch, relative heading, raw)"));
+  Serial.println(F("t          toggle pan tracking (PAN_MODE_TRACK, default OFF)"));
   Serial.println(F("b          print LED power-budget numbers"));
   Serial.println(F("p <0-255>  light-bar PWM override (bench: ignores lift gate)"));
   Serial.println(F("p auto     light-bar back to automatic (lift-gated)"));
@@ -1498,16 +1725,32 @@ static void ConsoleExecute(const char *line) {
       break;
 
     case 'i': {
-      sensors_event_t a, g, t;
-      if (imu.getEvent(&a, &g, &t)) {
-        Serial.printf("[i] accel %.2f %.2f %.2f m/s2  gyro %.3f %.3f %.3f rad/s  temp %.1f C\n",
-                      a.acceleration.x, a.acceleration.y, a.acceleration.z,
-                      g.gyro.x, g.gyro.y, g.gyro.z, t.temperature);
-      } else {
-        Serial.println("[i] IMU read failed");
+      ImuEstimate e;
+      ReadImu(e);
+      if (!e.present) {
+        Serial.println("[i] MPU6050 not detected at boot");
+        break;
       }
+      if (!e.calibrated) {
+        Serial.printf("[i] calibrating gyro bias (keep still)... errors %lu\n", (unsigned long)e.readErrors);
+        break;
+      }
+      Serial.printf("[i] roll %.1f  pitch %.1f  heading %.1f deg (relative, drifts)  yaw rate %.2f dps\n",
+                    (double)e.rollDeg, (double)e.pitchDeg, (double)ImuHeadingDeg(e), (double)e.yawRateDps);
+      Serial.printf("    accel %.2f %.2f %.2f m/s2  gyro %.4f %.4f %.4f rad/s  temp %.1f C  samples %lu  errors %lu\n",
+                    (double)e.ax, (double)e.ay, (double)e.az, (double)e.gx, (double)e.gy, (double)e.gz,
+                    (double)e.tempC, (unsigned long)e.samples, (unsigned long)e.readErrors);
+      Serial.printf("    pan mode %s (tracking %s)\n", g_panMode == PAN_MODE_TRACK ? "TRACK" : "MANUAL",
+                    g_panTrackEnabled ? "enabled" : "disabled");
       break;
     }
+
+    case 't':
+      g_panTrackEnabled = !g_panTrackEnabled;
+      g_trackNeedAnchor = true;
+      Serial.printf("[t] pan tracking %s%s\n", g_panTrackEnabled ? "ENABLED" : "disabled",
+                    g_panTrackEnabled ? " (anchors at the current pan position + heading)" : "");
+      break;
 
     case 'b':
       Serial.printf("[b] lit %u/%u px (%.3f) x applied %u/255 = %.4f (limit %.2f)  requested %u%s\n",
@@ -1667,7 +1910,13 @@ void setup() {
   if (!imu.begin(IMU_I2C_ADDR, &Wire)) {
     Serial.println("MPU6050 NOT DETECTED");
   } else {
-    Serial.println("MPU6050 OK");
+    Serial.println("MPU6050 OK -- calibrating gyro bias, keep still ~1 s");
+    Wire.setClock(IMU_I2C_CLOCK_HZ);
+    imu.setAccelerometerRange(MPU6050_RANGE_4_G);
+    imu.setGyroRange(MPU6050_RANGE_500_DEG);
+    imu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    g_imu.present = true;
+    StartImuTask();   // the IMU task owns Wire/imu from here on
   }
 
 
@@ -1732,7 +1981,7 @@ void loop() {
     ApplyBrightnessFromIndex();
   }
 
-  // Mode button (PB2) cycles lighting modes
+  // Mode button (PB2) click cycles lighting modes
   if (g_modePressedEdge) {
     g_mode = (LightingMode)((uint8_t)(g_mode + 1) % MODE_COUNT);
 
@@ -1746,6 +1995,15 @@ void loop() {
 
     g_pulsePhase = 0.0f;
     g_turnFrame  = 0;
+  }
+
+  // Mode button long press re-zeros the tracking heading
+  if (g_modeLongPressEdge) {
+    ImuEstimate e;
+    ReadImu(e);
+    g_yawZeroDeg = e.yawDeg;
+    g_trackNeedAnchor = true;
+    Serial.println("[MODE long] heading re-zeroed");
   }
 
   // -------------------- 3) STEPPER UPDATE --------------------

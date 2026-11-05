@@ -13,10 +13,12 @@ static const uint16_t BUTTON_DEBOUNCE_MS = 25;
 static bool g_turnLeftHeld=false, g_turnRightHeld=false, g_liftUpHeld=false, g_liftDownHeld=false;
 static bool g_brightnessPressedEdge=false, g_modePressedEdge=false;
 static bool g_liftChordActive=false, g_brightnessChordUsed=false, g_panLockout=false;
+static bool g_modeLongPressEdge=false, g_modeLongFired=false;
+static const uint16_t MODE_LONG_PRESS_MS = 1000;
 #include "ex.inc"
-static uint32_t t=0; static int clicks=0;
+static uint32_t t=0; static int clicks=0, modeClicks=0, modeLongs=0;
 struct Out { bool pl, pr, up, dn; };
-static Out step(int ms){ Out o{}; for(int i=0;i<ms;i++){ UpdateInputs(t++); if(g_brightnessPressedEdge) clicks++; } o={g_turnLeftHeld,g_turnRightHeld,g_liftUpHeld,g_liftDownHeld}; return o; }
+static Out step(int ms){ Out o{}; for(int i=0;i<ms;i++){ UpdateInputs(t++); if(g_brightnessPressedEdge) clicks++; if(g_modePressedEdge) modeClicks++; if(g_modeLongPressEdge) modeLongs++; } o={g_turnLeftHeld,g_turnRightHeld,g_liftUpHeld,g_liftDownHeld}; return o; }
 static int fails=0;
 #define EXPECT(cond,msg) do{ bool c_=(cond); printf("%-62s %s\n",msg,c_?"PASS":"FAIL"); if(!c_) fails++; }while(0)
 int main(){
@@ -54,4 +56,11 @@ int main(){
   pinState[2]=pinState[3]=1; step(60);
   // 9. bounce: 10 ms glitch on LEFT ignored
   pinState[2]=0; o=step(10); pinState[2]=1; o=step(60); EXPECT(!o.pl, "10 ms glitch on LEFT ignored (debounce)");
+  // 10. MODE click: fires on release, once
+  pinState[1]=0; step(100); EXPECT(modeClicks==0 && modeLongs==0, "MODE press: nothing yet");
+  pinState[1]=1; step(60);  EXPECT(modeClicks==1 && modeLongs==0, "MODE short release: one mode step");
+  // 11. MODE long press: re-zero fires once while held, no mode step on release
+  pinState[1]=0; step(1100); EXPECT(modeLongs==1 && modeClicks==1, "MODE held 1.1 s: one long-press, no mode step");
+  step(2000);               EXPECT(modeLongs==1, "MODE held longer: long-press does not repeat");
+  pinState[1]=1; step(60);  EXPECT(modeClicks==1, "MODE released after long press: no mode step");
   printf(fails? "%d FAILED\n" : "ALL PASS\n", fails); return fails?1:0; }
