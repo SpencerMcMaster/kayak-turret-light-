@@ -13,12 +13,15 @@
       - Up/Down lift axis
       - Left/Right rotation axis
     - 4x momentary pushbuttons
-      - Brightness
+      - Brightness            (click = next level, on release)
       - Mode select
-      - Turn left
-      - Turn right
+      - Turn left             (hold = pan left)
+      - Turn right            (hold = pan right)
+      - Brightness + Left     (hold = lift DOWN)
+      - Brightness + Right    (hold = lift UP)
     - GY-521 MPU6050 IMU for motion / orientation sensing
-    - Optional PWM-controlled auxiliary output
+    - Light-bar PWM: 3x 18 W bars dimmed together via a MOSFET module
+      (5 kHz LEDC, on only when the lift is at its UP soft limit)
 
   Electrical Notes:
     - LED strips powered from 12V supply (NOT from Arduino)
@@ -113,6 +116,17 @@ static const float LED_POWER_BUDGET_MAX = 0.20f;
 
 // Number of discrete brightness steps for PB1
 static const uint8_t BRIGHTNESS_LEVELS = 4;
+
+// -------------------- LIGHT BARS (PWM CONTROL on J2.5) --------------------
+// Single-channel MOSFET module, accepts 0-20 kHz PWM. LEDC hardware PWM
+// (the LED strips use RMT, so no peripheral conflict).
+static const uint8_t  LIGHTBAR_LEDC_CHANNEL = 0;
+static const uint32_t LIGHTBAR_PWM_FREQ_HZ  = 5000;
+static const uint8_t  LIGHTBAR_PWM_RES_BITS = 8;     // duty 0..255
+// Light-bar duty per brightness index (same button as the strips)
+static const uint8_t  LIGHTBAR_DUTY_BY_INDEX[] = { 64, 128, 191, 255 };
+static_assert(sizeof(LIGHTBAR_DUTY_BY_INDEX) == BRIGHTNESS_LEVELS,
+              "LIGHTBAR_DUTY_BY_INDEX needs exactly one entry per brightness level");
 
 // -------------------- ANIMATION TIMING --------------------
 // All values in milliseconds unless otherwise noted
@@ -489,8 +503,13 @@ static uint32_t g_lastFrameMs = 0;
 // -------------------- BUTTON EDGE STATE (DEBOUNCE) --------------------
 // We will implement a small debounce/edge detector struct in the next block.
 // These placeholders exist so the "state section" documents what we track.
-static bool g_brightnessPressedEdge = false;
+static bool g_brightnessPressedEdge = false;   // brightness CLICK (see UpdateInputs)
 static bool g_modePressedEdge       = false;
+
+// -------------------- LIFT CHORD STATE --------------------
+static bool g_liftChordActive     = false;  // BRIGHTNESS held + LEFT/RIGHT held
+static bool g_brightnessChordUsed = false;  // a chord happened during this BRIGHTNESS hold
+static bool g_panLockout          = false;  // LEFT/RIGHT must be released after a chord
 
 // ============================================================================
 // END OF GLOBAL STATE
@@ -508,6 +527,8 @@ struct DebouncedButton {
   bool lastRaw;          // last raw sample
   uint32_t lastChangeMs; // last time raw changed
   bool pressedEdge;      // one-shot on press (HIGH->LOW)
+  bool releasedEdge;     // one-shot on release (LOW->HIGH)
+  uint32_t pressedAtMs;  // time of the last debounced press
 };
 
 // -------------------- LED HELPERS --------------------
@@ -622,10 +643,42 @@ static void ApplyBrightnessFromIndex() {
   SetBrightnessAll(BrightnessFromIndex(g_brightnessIndex));
 }
 
-// -------------------- PWM HELPER (AUX OUTPUT) --------------------
+// -------------------- PWM HELPER (LIGHT BARS) --------------------
+// LEDC hardware PWM, 5 kHz, 8-bit. Call LightBarPwmInit() once first.
+static void LightBarPwmInit() {
+  digitalWrite(PIN_PWM_DATA, LOW);              // hold the MOSFET input low...
+  pinMode(PIN_PWM_DATA, OUTPUT);
+  ledcSetup(LIGHTBAR_LEDC_CHANNEL, LIGHTBAR_PWM_FREQ_HZ, LIGHTBAR_PWM_RES_BITS);
+  ledcWrite(LIGHTBAR_LEDC_CHANNEL, 0);          // ...and set duty 0 before attaching
+  ledcAttachPin(PIN_PWM_DATA, LIGHTBAR_LEDC_CHANNEL);
+  g_lightBarDuty = 0;
+}
+
 static void SetAuxPwmDuty(uint8_t duty /*0..255*/) {
   g_lightBarDuty = duty;
-  analogWrite(PIN_PWM_DATA, duty);
+  ledcWrite(LIGHTBAR_LEDC_CHANNEL, duty);
+}
+
+// Light bars follow the brightness index, but are ONLY on when the lift is
+// at its UP soft limit (stopped, driver enabled so the position is trusted).
+// ASSUMPTION: MODE_OFF also turns the light bars off.
+// A console 'p <n>' override (bench use) bypasses the lift gate until 'p auto'.
+static int16_t g_lightBarOverride = -1;   // -1 = automatic
+
+static bool LiftAtUpLimit() {
+  AxisFeedback lr, ud;
+  ReadMotionFeedback(lr, ud);
+  return g_drvUD.enabled && !ud.running && (ud.position >= UD_STEP_LIMIT);
+}
+
+static void UpdateLightBars() {
+  uint8_t duty = 0;
+  if (g_lightBarOverride >= 0) {
+    duty = (uint8_t)g_lightBarOverride;
+  } else if (g_mode != MODE_OFF && LiftAtUpLimit()) {
+    duty = LIGHTBAR_DUTY_BY_INDEX[g_brightnessIndex];
+  }
+  if (duty != g_lightBarDuty) SetAuxPwmDuty(duty);
 }
 
 // -------------------- STATUS LED (onboard RGB, active-LOW) --------------------
@@ -666,10 +719,10 @@ static void ReadMotionFeedback(AxisFeedback &lr, AxisFeedback &ud) {
 }
 
 // -------------------- BUTTON INSTANCES --------------------
-static DebouncedButton btnBrightness = { PIN_PB_BRIGHTNESS, HIGH, HIGH, 0, false };
-static DebouncedButton btnMode       = { PIN_PB_MODE,       HIGH, HIGH, 0, false };
-static DebouncedButton btnTurnLeft   = { PIN_PB_TURN_LEFT,  HIGH, HIGH, 0, false };
-static DebouncedButton btnTurnRight  = { PIN_PB_TURN_RIGHT, HIGH, HIGH, 0, false };
+static DebouncedButton btnBrightness = { PIN_PB_BRIGHTNESS, HIGH, HIGH, 0, false, false, 0 };
+static DebouncedButton btnMode       = { PIN_PB_MODE,       HIGH, HIGH, 0, false, false, 0 };
+static DebouncedButton btnTurnLeft   = { PIN_PB_TURN_LEFT,  HIGH, HIGH, 0, false, false, 0 };
+static DebouncedButton btnTurnRight  = { PIN_PB_TURN_RIGHT, HIGH, HIGH, 0, false, false, 0 };
 
 // -------------------- BUTTON FUNCTIONS --------------------
 static void UpdateButton(DebouncedButton &b, uint32_t nowMs) {
@@ -683,7 +736,12 @@ static void UpdateButton(DebouncedButton &b, uint32_t nowMs) {
   if ((nowMs - b.lastChangeMs) >= BUTTON_DEBOUNCE_MS) {
     if (b.lastStable != raw) {
       b.lastStable = raw;
-      if (raw == LOW) b.pressedEdge = true; // active-low press edge
+      if (raw == LOW) {
+        b.pressedEdge = true;               // active-low press edge
+        b.pressedAtMs = nowMs;
+      } else {
+        b.releasedEdge = true;              // release edge
+      }
     }
   }
 }
@@ -696,21 +754,59 @@ static bool ConsumePressedEdge(DebouncedButton &b) {
   return false;
 }
 
+static bool ConsumeReleasedEdge(DebouncedButton &b) {
+  if (b.releasedEdge) {
+    b.releasedEdge = false;
+    return true;
+  }
+  return false;
+}
+
 static bool IsHeld(const DebouncedButton &b) {
   return (b.lastStable == LOW);
 }
 
+// Button map (J6, no extra hardware):
+//   BRIGHTNESS click (press+release, no chord)  -> next brightness level
+//   MODE press                                  -> next lighting mode
+//   LEFT / RIGHT held                           -> pan jog (+ turn overlay)
+//   BRIGHTNESS held + LEFT held                 -> lift DOWN
+//   BRIGHTNESS held + RIGHT held                -> lift UP
+// While BRIGHTNESS is held, LEFT/RIGHT belong to the lift chord: pan jog and
+// the turn overlay are suppressed, and the brightness click is cancelled.
+// A LEFT/RIGHT that was part of a chord stays locked out of pan jog until
+// it is released, so letting go of BRIGHTNESS first cannot start a pan move.
 static void UpdateInputs(uint32_t nowMs) {
   UpdateButton(btnBrightness, nowMs);
   UpdateButton(btnMode,       nowMs);
   UpdateButton(btnTurnLeft,   nowMs);
   UpdateButton(btnTurnRight,  nowMs);
 
-  g_brightnessPressedEdge = ConsumePressedEdge(btnBrightness);
-  g_modePressedEdge       = ConsumePressedEdge(btnMode);
+  const bool brightPressed  = ConsumePressedEdge(btnBrightness);
+  const bool brightReleased = ConsumeReleasedEdge(btnBrightness);
+  g_modePressedEdge         = ConsumePressedEdge(btnMode);
 
-  g_turnLeftHeld  = IsHeld(btnTurnLeft);
-  g_turnRightHeld = IsHeld(btnTurnRight);
+  const bool brightHeld = IsHeld(btnBrightness);
+  const bool leftHeld   = IsHeld(btnTurnLeft);
+  const bool rightHeld  = IsHeld(btnTurnRight);
+
+  // ---- Lift chord ----
+  g_liftChordActive = brightHeld && (leftHeld || rightHeld);
+  g_liftDownHeld    = brightHeld && leftHeld && !rightHeld;
+  g_liftUpHeld      = brightHeld && rightHeld && !leftHeld;
+
+  // ---- Brightness click: fires on RELEASE, only if no chord happened ----
+  if (brightPressed) g_brightnessChordUsed = false;
+  if (g_liftChordActive) g_brightnessChordUsed = true;
+  g_brightnessPressedEdge = brightReleased && !g_brightnessChordUsed;
+  if (brightReleased) g_brightnessChordUsed = false;
+
+  // ---- Pan jog / turn overlay (suppressed by the chord) ----
+  if (g_liftChordActive) g_panLockout = true;
+  if (!leftHeld && !rightHeld) g_panLockout = false;
+  const bool panAllowed = !brightHeld && !g_panLockout;
+  g_turnLeftHeld  = panAllowed && leftHeld;
+  g_turnRightHeld = panAllowed && rightHeld;
 }
 
 // ============================================================================
@@ -1334,7 +1430,8 @@ static void ConsoleHelp() {
   Serial.println(F("s          short out-and-back jog on each axis (within soft limits)"));
   Serial.println(F("i          print IMU"));
   Serial.println(F("b          print LED power-budget numbers"));
-  Serial.println(F("p <0-255>  set light-bar PWM duty"));
+  Serial.println(F("p <0-255>  light-bar PWM override (bench: ignores lift gate)"));
+  Serial.println(F("p auto     light-bar back to automatic (lift-gated)"));
 }
 
 static void DumpDriver(TMC2209Stepper &d, const DriverStatus &st, const char *name,
@@ -1420,14 +1517,21 @@ static void ConsoleExecute(const char *line) {
       break;
 
     case 'p': {
+      if (strncmp(arg, "auto", 4) == 0) {
+        g_lightBarOverride = -1;
+        Serial.println("[p] light bars automatic (on only with lift at UP limit)");
+        break;
+      }
       char *end = nullptr;
       const long v = strtol(arg, &end, 10);
       if (end == arg || v < 0 || v > 255) {
-        Serial.println("[p] usage: p <0-255>");
+        Serial.printf("[p] usage: p <0-255> | p auto   (now: %s, duty %u)\n",
+                      g_lightBarOverride >= 0 ? "override" : "auto", g_lightBarDuty);
         break;
       }
-      SetAuxPwmDuty((uint8_t)v);
-      Serial.printf("[p] light-bar duty %ld/255\n", v);
+      g_lightBarOverride = (int16_t)v;
+      Serial.printf("[p] light-bar OVERRIDE duty %ld/255 at %lu Hz (lift gate bypassed; 'p auto' to clear)\n",
+                    v, (unsigned long)LIGHTBAR_PWM_FREQ_HZ);
       break;
     }
 
@@ -1502,9 +1606,8 @@ void setup() {
   EnforcePowerBudget();
   ShowAllStrips();
 
-  // Light-bar PWM at 0
-  pinMode(PIN_PWM_DATA, OUTPUT);
-  SetAuxPwmDuty(0);
+  // Light-bar PWM at 0 (LEDC 5 kHz, attached with duty already 0)
+  LightBarPwmInit();
 
   // Status LED off
   StatusLedInit();
@@ -1650,6 +1753,9 @@ void loop() {
   // enforces the soft limits. Done before rendering so button-to-motion
   // latency does not include a ~24 ms show().
   UpdateSteppersJog();
+
+  // Light bars: brightness-index duty, gated on lift at UP soft limit
+  UpdateLightBars();
 
   // -------------------- 4) LED RENDERING (frame scheduler) --------------------
   // Replaces the old delay(5): render + show at FRAME_INTERVAL_MS. Steppers
