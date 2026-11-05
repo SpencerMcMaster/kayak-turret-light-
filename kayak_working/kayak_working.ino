@@ -179,6 +179,12 @@ static const uint8_t  TMC_TPOWERDOWN      = 20;      // standstill -> IHOLD afte
 static const uint32_t TMC_TCOOLTHRS       = 0;
 static const uint8_t  TMC_SGTHRS          = 0;
 
+// Runtime health check: every enabled driver's GCONF is re-read at this
+// period. A failed read (e.g. 12 V lost: the TMC2209 logic runs from VS) or
+// a reverted GCONF (chip reset -> factory config, VREF-scaled current)
+// disables that driver immediately. Re-enable with console 'r' or a reboot.
+static const uint16_t TMC_HEALTH_PERIOD_MS = 250;
+
 // -------------------- IMU (MPU6050 via Adafruit_MPU6050) --------------------
 // Library choice: Adafruit_MPU6050, not the jrowberg DMP. With no
 // magnetometer the DMP's yaw is also pure gyro integration (same drift), so
@@ -191,6 +197,13 @@ static const uint16_t IMU_CAL_SAMPLES        = 100;    // 1 s gyro-bias average 
 static const float    IMU_COMP_ALPHA         = 0.98f;  // complementary filter: gyro weight
 static const uint32_t IMU_I2C_CLOCK_HZ       = 400000;
 static const uint32_t IMU_TASK_STACK         = 4096;
+// Sample conversion for the ranges set in setup() (+/-4 g, +/-500 dps)
+static const float    IMU_ACCEL_LSB_PER_G    = 8192.0f;
+static const float    IMU_GYRO_LSB_PER_DPS   = 65.5f;
+// Plausibility gate (rejects a stuck bus reading all 0x00 / 0xFF): |a| must
+// be within these bounds (gravity = 9.8 m/s^2)
+static const float    IMU_ACCEL_MIN_MS2      = 2.0f;
+static const float    IMU_ACCEL_MAX_MS2      = 35.0f;
 static const UBaseType_t IMU_TASK_PRIO       = 2;      // above loopTask (1) on core 1
 
 // -------------------- PAN TRACKING (SCAFFOLD, OFF BY DEFAULT) --------------------
@@ -433,6 +446,13 @@ struct PowerBudgetStats {
 static PowerBudgetStats g_budget = { 0, LED_TOTAL_PIXELS, 0.0f, 0, 0, 0.0f, false };
 static bool g_budgetFresh = false;  // set by EnforcePowerBudget, consumed by ShowAllStrips
 
+// Per-strip budget terms (lit pixels x applied brightness): what this frame
+// will send, and what each strip is currently showing. ShowAllStrips() uses
+// them to order the strip updates so every partially-sent frame stays within
+// budget too (strips are sent one after another over ~25 ms).
+static uint32_t g_stripLitNew[LED_STRIP_COUNT]   = { 0 };
+static uint32_t g_stripPowerNow[LED_STRIP_COUNT] = { 0 };
+
 // -------------------- TURN / HAZARD STATE --------------------
 // Hold-to-jog behavior will use PB3/PB4 states directly,
 // but we still keep flags for overlay rendering logic.
@@ -481,6 +501,7 @@ struct DriverStatus {
 };
 static DriverStatus g_drvUD = { false, false, 0xFF, 0, 0 };
 static DriverStatus g_drvLR = { false, false, 0xFF, 0, 0 };
+static uint32_t g_lastHealthMs = 0;
 
 // -------------------- MOTION COMMANDS (loop -> stepper task) --------------------
 // loop() (core 1) writes commands; the stepper task (core 0) owns the
@@ -506,6 +527,7 @@ static AxisCommand   g_cmdLR = { AXIS_HOLD, 0, false };
 static AxisCommand   g_cmdUD = { AXIS_HOLD, 0, false };
 static AxisFeedback  g_fbLR  = { 0, 0, false };
 static AxisFeedback  g_fbUD  = { 0, 0, false };
+static uint32_t      g_engineTicks = 0;   // stepper-task iterations (under g_motionMux)
 static TaskHandle_t  g_stepperTask = nullptr;
 
 // Per-axis engine memory (stepper task only). Declared here, ahead of the
@@ -535,9 +557,10 @@ struct ImuEstimate {
   float    tempC;
   uint32_t samples;
   uint32_t readErrors;
+  uint16_t consecutiveErrors;  // 0 = last sample good; tracking requires 0
 };
 static portMUX_TYPE g_imuMux = portMUX_INITIALIZER_UNLOCKED;
-static ImuEstimate  g_imu = { false, false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+static ImuEstimate  g_imu = { false, false, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 static float        g_yawZeroDeg = 0.0f;  // loop-side offset; heading = yawDeg - g_yawZeroDeg
 
 // -------------------- PAN TRACKING STATE --------------------
@@ -618,12 +641,16 @@ static void EnforcePowerBudget() {
     const uint8_t *px = s->getPixels();
     const uint16_t n = s->numPixels();
     total += n;
+    g_stripLitNew[si] = 0;
     if (px == nullptr) continue;  // begin()/alloc failed: nothing can be shown
     for (uint16_t i = 0; i < n; i++) {
       const uint8_t *p = px + (uint32_t)i * LED_BYTES_PER_PIXEL;
       uint8_t any = 0;
       for (uint8_t c = 0; c < LED_BYTES_PER_PIXEL; c++) any |= p[c];
-      if (any) lit++;
+      if (any) {
+        lit++;
+        g_stripLitNew[si]++;
+      }
     }
   }
 
@@ -660,9 +687,26 @@ static void ShowAllStrips() {
   // computed from the current buffers.
   if (!g_budgetFresh) EnforcePowerBudget();
 
-  const uint16_t scale = (uint16_t)g_budget.applied + 1;  // 1..256, same math as the library
+  const uint16_t applied = g_budget.applied;
 
+  // Send order: strips whose budget term goes DOWN first, then the ones that
+  // go UP. Every intermediate (part old, part new) state is then bounded by
+  // max(old frame, new frame), both of which passed the budget.
+  uint8_t order[LED_STRIP_COUNT];
+  int32_t delta[LED_STRIP_COUNT];
   for (uint8_t si = 0; si < LED_STRIP_COUNT; si++) {
+    order[si] = si;
+    delta[si] = (int32_t)(g_stripLitNew[si] * applied) - (int32_t)g_stripPowerNow[si];
+  }
+  for (uint8_t i = 1; i < LED_STRIP_COUNT; i++) {        // insertion sort (4 strips)
+    const uint8_t o = order[i];
+    int8_t j = (int8_t)i - 1;
+    while (j >= 0 && delta[order[j]] > delta[o]) { order[j + 1] = order[j]; j--; }
+    order[j + 1] = o;
+  }
+
+  for (uint8_t k = 0; k < LED_STRIP_COUNT; k++) {
+    const uint8_t si = order[k];
     Adafruit_NeoPixel *s = LED_STRIPS[si];
     uint8_t *px = s->getPixels();
     if (px == nullptr) continue;
@@ -671,10 +715,12 @@ static void ShowAllStrips() {
 
     memcpy(g_showScratch, px, nBytes);
     for (uint32_t i = 0; i < nBytes; i++) {
-      px[i] = (uint8_t)(((uint16_t)px[i] * scale) >> 8);
+      // floor(c * applied / 255): never brighter than the budgeted fraction
+      px[i] = (uint8_t)(((uint16_t)px[i] * applied) / 255u);
     }
     s->show();                       // blocking: RMT transmit completes before return
     memcpy(px, g_showScratch, nBytes);
+    g_stripPowerNow[si] = g_stripLitNew[si] * applied;
   }
 
   g_budgetFresh = false;
@@ -755,14 +801,39 @@ static void StatusLed(bool r, bool g, bool b) {
 
 // -------------------- DRIVER ENABLE --------------------
 // Only a driver whose UART config was verified may be enabled.
-static bool SetDriverEnabled(DriverStatus &st, uint8_t enPin, bool enable) {
-  if (enable && !st.configOk) return false;
-  digitalWrite(enPin, enable ? LOW : HIGH);   // ~{EN}: LOW = enabled
-  st.enabled = enable;
+static uint32_t EngineTicks() {
+  portENTER_CRITICAL(&g_motionMux);
+  const uint32_t t = g_engineTicks;
+  portEXIT_CRITICAL(&g_motionMux);
+  return t;
+}
+
+static void SetAxisEnabledFlag(DriverStatus &st, bool enable) {
   portENTER_CRITICAL(&g_motionMux);
   if (&st == &g_drvLR) g_cmdLR.enabled = enable;
   else                 g_cmdUD.enabled = enable;
   portEXIT_CRITICAL(&g_motionMux);
+}
+
+// Enable: EN LOW first, then let the engine step.
+// Disable: stop the engine stepping first (wait for it to pick that up, so
+// no step is counted that the driver would ignore), then EN HIGH.
+static bool SetDriverEnabled(DriverStatus &st, uint8_t enPin, bool enable) {
+  if (enable && !st.configOk) return false;
+  if (enable) {
+    digitalWrite(enPin, LOW);                 // ~{EN}: LOW = enabled
+    st.enabled = true;
+    SetAxisEnabledFlag(st, true);
+  } else {
+    SetAxisEnabledFlag(st, false);
+    if (g_stepperTask != nullptr) {
+      const uint32_t t0 = EngineTicks();
+      const uint32_t startMs = millis();
+      while ((EngineTicks() - t0) < 2 && (millis() - startMs) < 5) { /* <= ~2 ms */ }
+    }
+    digitalWrite(enPin, HIGH);
+    st.enabled = false;
+  }
   return true;
 }
 
@@ -1128,6 +1199,13 @@ static void ApplyTurnHazardOverlay(uint32_t nowMs) {
 // user of Wire/imu after setup(). It publishes an ImuEstimate under
 // g_imuMux; everything else reads it with ReadImu().
 //
+//  - Samples are read with a direct 14-byte Wire burst, NOT
+//    Adafruit_MPU6050::getEvent(): in 2.2.9 getEvent() always returns true
+//    and decodes an uninitialised buffer if the I2C transfer fails. Here a
+//    NACK / short read is detected and the sample is rejected, and a
+//    plausibility gate on |accel| rejects a stuck bus. Rejected samples
+//    count in readErrors / consecutiveErrors; tracking pauses on any error.
+//
 //  - Gyro bias: mean of the first IMU_CAL_SAMPLES samples (keep still ~1 s).
 //  - Roll/pitch: complementary filter (gyro integration + accel gravity).
 //  - Yaw: integral of the tilt-compensated yaw rate
@@ -1148,6 +1226,30 @@ static float ImuHeadingDeg(const ImuEstimate &e) {
   return e.yawDeg - g_yawZeroDeg;
 }
 
+// Burst-read ACCEL_XOUT_H (0x3B) .. GYRO_ZOUT_L (0x48). false on any I2C error.
+static bool ImuReadSample(float &ax, float &ay, float &az,
+                          float &gx, float &gy, float &gz, float &tempC) {
+  Wire.beginTransmission(IMU_I2C_ADDR);
+  Wire.write((uint8_t)0x3B);
+  if (Wire.endTransmission(false) != 0) return false;            // NACK / bus error
+  if (Wire.requestFrom((uint8_t)IMU_I2C_ADDR, (uint8_t)14) != 14) return false;
+  uint8_t b[14];
+  for (uint8_t i = 0; i < 14; i++) b[i] = (uint8_t)Wire.read();
+
+  const float G = 9.80665f;
+  const float DEG2RAD = 0.0174532925f;
+  ax = (float)(int16_t)((b[0]  << 8) | b[1])  / IMU_ACCEL_LSB_PER_G * G;
+  ay = (float)(int16_t)((b[2]  << 8) | b[3])  / IMU_ACCEL_LSB_PER_G * G;
+  az = (float)(int16_t)((b[4]  << 8) | b[5])  / IMU_ACCEL_LSB_PER_G * G;
+  tempC = (float)(int16_t)((b[6] << 8) | b[7]) / 340.0f + 36.53f;
+  gx = (float)(int16_t)((b[8]  << 8) | b[9])  / IMU_GYRO_LSB_PER_DPS * DEG2RAD;
+  gy = (float)(int16_t)((b[10] << 8) | b[11]) / IMU_GYRO_LSB_PER_DPS * DEG2RAD;
+  gz = (float)(int16_t)((b[12] << 8) | b[13]) / IMU_GYRO_LSB_PER_DPS * DEG2RAD;
+
+  const float aMag = sqrtf(ax * ax + ay * ay + az * az);
+  return (aMag >= IMU_ACCEL_MIN_MS2) && (aMag <= IMU_ACCEL_MAX_MS2);
+}
+
 static void ImuTask(void * /*arg*/) {
   float biasX = 0.0f, biasY = 0.0f, biasZ = 0.0f;
   uint16_t calCount = 0;
@@ -1159,8 +1261,8 @@ static void ImuTask(void * /*arg*/) {
   for (;;) {
     vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(IMU_PERIOD_MS));
 
-    sensors_event_t a, g, t;
-    const bool ok = imu.getEvent(&a, &g, &t);
+    float ax, ay, az, gxRaw, gyRaw, gzRaw, tempC;
+    const bool ok = ImuReadSample(ax, ay, az, gxRaw, gyRaw, gzRaw, tempC);
     const uint32_t nowUs = micros();
     float dt = (float)(nowUs - lastUs) * 1e-6f;
     lastUs = nowUs;
@@ -1168,6 +1270,7 @@ static void ImuTask(void * /*arg*/) {
     if (!ok) {
       portENTER_CRITICAL(&g_imuMux);
       g_imu.readErrors++;
+      if (g_imu.consecutiveErrors < 0xFFFF) g_imu.consecutiveErrors++;
       portEXIT_CRITICAL(&g_imuMux);
       continue;
     }
@@ -1175,7 +1278,7 @@ static void ImuTask(void * /*arg*/) {
 
     // ---- Gyro bias calibration (first second) ----
     if (calCount < IMU_CAL_SAMPLES) {
-      biasX += g.gyro.x;  biasY += g.gyro.y;  biasZ += g.gyro.z;
+      biasX += gxRaw;  biasY += gyRaw;  biasZ += gzRaw;
       calCount++;
       if (calCount == IMU_CAL_SAMPLES) {
         biasX /= (float)IMU_CAL_SAMPLES;
@@ -1185,8 +1288,7 @@ static void ImuTask(void * /*arg*/) {
       continue;
     }
 
-    const float ax = a.acceleration.x, ay = a.acceleration.y, az = a.acceleration.z;
-    const float gx = g.gyro.x - biasX, gy = g.gyro.y - biasY, gz = g.gyro.z - biasZ;
+    const float gx = gxRaw - biasX, gy = gyRaw - biasY, gz = gzRaw - biasZ;
 
     // ---- Roll / pitch: complementary filter ----
     const float rollAcc  = atan2f(ay, az) * RAD2DEG;
@@ -1214,8 +1316,9 @@ static void ImuTask(void * /*arg*/) {
     g_imu.yawRateDps = yawRate * RAD2DEG;
     g_imu.ax = ax;  g_imu.ay = ay;  g_imu.az = az;
     g_imu.gx = gx;  g_imu.gy = gy;  g_imu.gz = gz;
-    g_imu.tempC = t.temperature;
+    g_imu.tempC = tempC;
     g_imu.samples++;
+    g_imu.consecutiveErrors = 0;
     portEXIT_CRITICAL(&g_imuMux);
   }
 }
@@ -1259,6 +1362,26 @@ static const char *ConnResultText(uint8_t r) {
   }
 }
 
+// TMCStepper treats a reply whose CRC byte is 0 as an error, which for the
+// IFCNT register happens for particular counter values. If a read fails,
+// bump the counter with one harmless re-write and read again.
+static bool ReadIfcnt(TMC2209Stepper &d, uint8_t &value, uint8_t &extraWrites) {
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    value = d.IFCNT();
+    if (!d.CRCerror) return true;
+    d.TPOWERDOWN(TMC_TPOWERDOWN);   // same value as configured; increments IFCNT
+    extraWrites++;
+  }
+  return false;
+}
+
+// vsense the library will choose in rms_current() (same formula as
+// TMCStepper::rms_current), used to verify the CHOPCONF read-back.
+static bool ExpectedVsense(uint16_t mA, float rSense) {
+  const float cs = 32.0f * 1.41421f * (float)mA / 1000.0f * (rSense + 0.02f) / 0.325f - 1.0f;
+  return (uint8_t)cs < 16;
+}
+
 static bool ConfigureDriver(TMC2209Stepper &d, DriverStatus &st, const char *name) {
   st.configOk = false;
   st.ifcntDelta = 0;
@@ -1280,7 +1403,12 @@ static bool ConfigureDriver(TMC2209Stepper &d, DriverStatus &st, const char *nam
     return false;
   }
 
-  const uint8_t ifcntBefore = d.IFCNT();
+  uint8_t ifcntBefore = 0;
+  uint8_t extraBefore = 0;
+  if (!ReadIfcnt(d, ifcntBefore, extraBefore)) {
+    Serial.printf("[TMC] %s: IFCNT read failed\n", name);
+    return false;
+  }
   uint8_t writes = 0;
 
   d.GCONF(gconf);                          writes++;
@@ -1308,15 +1436,24 @@ static bool ConfigureDriver(TMC2209Stepper &d, DriverStatus &st, const char *nam
   d.TCOOLTHRS(TMC_TCOOLTHRS);              writes++;  // StallGuard placeholders (disabled)
   d.SGTHRS(TMC_SGTHRS);                    writes++;
 
-  const uint8_t ifcntAfter = d.IFCNT();
+  uint8_t ifcntAfter = 0;
+  uint8_t extraAfter = 0;
+  const bool ifcntRead = ReadIfcnt(d, ifcntAfter, extraAfter);
+  writes += extraAfter;
   st.ifcntDelta = (uint8_t)(ifcntAfter - ifcntBefore);
   st.ifcntExpected = writes;
 
+  // Read-back. Note begin() already set pdn_disable/mstep_reg_select and
+  // TOFF=3 / pwm_autoscale are reset defaults, so these alone prove little;
+  // the IFCNT count is what proves every write (incl. write-only IHOLD_IRUN)
+  // landed. vsense is the current-range bit and IS checked here.
   const bool gconfOk = d.pdn_disable() && d.mstep_reg_select() &&
                        !d.I_scale_analog() && !d.en_spreadCycle();
-  const bool chopOk  = (d.microsteps() == TMC_MICROSTEPS) && (d.toff() == TMC_TOFF);
+  const bool chopOk  = (d.microsteps() == TMC_MICROSTEPS) && (d.toff() == TMC_TOFF) &&
+                       (d.vsense() == ExpectedVsense(TMC_RUN_CURRENT_MA, TMC_R_SENSE)) &&
+                       !d.CRCerror;
   const bool pwmOk   = d.pwm_autoscale();
-  const bool ifcntOk = (st.ifcntDelta == st.ifcntExpected);
+  const bool ifcntOk = ifcntRead && (st.ifcntDelta == st.ifcntExpected);
 
   st.configOk = gconfOk && chopOk && pwmOk && ifcntOk;
 
@@ -1327,6 +1464,64 @@ static bool ConfigureDriver(TMC2209Stepper &d, DriverStatus &st, const char *nam
                 st.configOk ? "CONFIG OK" : "CONFIG FAILED",
                 d.rms_current(), (double)(TMC_HOLD_MULTIPLIER * 100.0f));
   return st.configOk;
+}
+
+// Configure both drivers and enable ONLY the verified ones. Used at boot and
+// by console 'r'. Status LED: BLUE while probing, GREEN = both verified,
+// RED = one or both failed (a failed driver stays disabled).
+static void BringUpDrivers() {
+  SetDriverEnabled(g_drvUD, PIN_UPDOWN_EN, false);
+  SetDriverEnabled(g_drvLR, PIN_LEFTRIGHT_EN, false);
+  StatusLed(false, false, true);
+
+  const bool okUD = ConfigureDriver(driverUpDown,    g_drvUD, "UP/DOWN (A2, addr 0)");
+  const bool okLR = ConfigureDriver(driverLeftRight, g_drvLR, "LEFT/RIGHT (A3, addr 1)");
+
+  // SAFE POWER-ON: a driver is enabled ONLY after its UART config verified.
+  // A driver that failed stays disabled: its current would otherwise be set
+  // by the module's VREF trimpot, not by firmware.
+  SetDriverEnabled(g_drvUD, PIN_UPDOWN_EN,    okUD);
+  SetDriverEnabled(g_drvLR, PIN_LEFTRIGHT_EN, okLR);
+  if (okUD && okLR) {
+    StatusLed(false, true, false);
+    Serial.println("[TMC] both drivers verified and ENABLED");
+  } else {
+    StatusLed(true, false, false);
+    Serial.printf("[TMC] driver config FAILED (UP/DOWN %s, LEFT/RIGHT %s) -- failed driver(s) left DISABLED\n",
+                  okUD ? "ok" : "FAIL", okLR ? "ok" : "FAIL");
+  }
+}
+
+// GCONF bits this firmware sets (TMC2209 datasheet): I_scale_analog = bit 0
+// (must be 0), en_spreadCycle = bit 2 (0), pdn_disable = bit 6 (1),
+// mstep_reg_select = bit 7 (1). A chip reset (VS brown-out) reverts them.
+static bool DriverStillConfigured(TMC2209Stepper &d) {
+  const uint32_t g = d.GCONF();
+  if (d.CRCerror) return false;                       // no/garbled reply
+  return ((g & (1UL << 6)) != 0) && ((g & (1UL << 7)) != 0) &&
+         ((g & (1UL << 0)) == 0) && ((g & (1UL << 2)) == 0);
+}
+
+// Called from loop(). Any enabled driver that no longer answers, or whose
+// GCONF reverted, is disabled at once and must be re-verified ('r'/reboot).
+static void CheckDriverHealth(uint32_t nowMs) {
+  if ((nowMs - g_lastHealthMs) < TMC_HEALTH_PERIOD_MS) return;
+  g_lastHealthMs = nowMs;
+
+  struct { TMC2209Stepper *d; DriverStatus *st; uint8_t en; const char *name; } drv[2] = {
+    { &driverUpDown,    &g_drvUD, PIN_UPDOWN_EN,    "UP/DOWN" },
+    { &driverLeftRight, &g_drvLR, PIN_LEFTRIGHT_EN, "LEFT/RIGHT" },
+  };
+  for (uint8_t i = 0; i < 2; i++) {
+    if (!drv[i].st->enabled) continue;
+    if (!DriverStillConfigured(*drv[i].d)) {
+      SetDriverEnabled(*drv[i].st, drv[i].en, false);
+      drv[i].st->configOk = false;
+      StatusLed(true, false, false);
+      Serial.printf("[TMC] %s FAULT: no reply or config lost (12 V dropout / driver reset) -> DISABLED. "
+                    "Position may be lost; 'r' to re-verify\n", drv[i].name);
+    }
+  }
 }
 
 // ============================================================================
@@ -1472,6 +1667,7 @@ static void StepperTask(void * /*arg*/) {
     portENTER_CRITICAL(&g_motionMux);
     g_fbLR = fbLR;
     g_fbUD = fbUD;
+    g_engineTicks++;
     portEXIT_CRITICAL(&g_motionMux);
 
     const uint32_t nowMs = millis();
@@ -1555,6 +1751,9 @@ static bool UpdatePanTracking(const AxisFeedback &lr, bool manualActive, long &t
   if (!est.calibrated || manualActive) {
     g_trackNeedAnchor = true;          // manual wins; re-anchor after release
     return false;
+  }
+  if (est.consecutiveErrors != 0) {
+    return false;                      // bad IMU data: hold (engine decelerates), keep anchor
   }
   if (g_trackNeedAnchor) {
     if (lr.running) return false;      // let the manual move finish (engine HOLD = decel)
@@ -1653,6 +1852,7 @@ static void ConsoleHelp() {
   Serial.println(F("?          this menu"));
   Serial.println(F("e          toggle driver EN (only drivers whose UART config verified)"));
   Serial.println(F("d          dump test_connection + DRV_STATUS for both drivers"));
+  Serial.println(F("r          re-run driver UART config (after a fault); enables verified drivers"));
   Serial.println(F("s          short out-and-back jog on each axis (within soft limits)"));
   Serial.println(F("i          print IMU (filtered roll/pitch, relative heading, raw)"));
   Serial.println(F("t          toggle pan tracking (PAN_MODE_TRACK, default OFF)"));
@@ -1704,8 +1904,18 @@ static void ConsoleExecute(const char *line) {
       Serial.printf("[e] UP/DOWN %s%s, LEFT/RIGHT %s%s\n",
                     g_drvUD.enabled ? "ENABLED" : "disabled", okUD ? "" : " (refused: config not verified)",
                     g_drvLR.enabled ? "ENABLED" : "disabled", okLR ? "" : " (refused: config not verified)");
+      if (!want) {
+        Serial.println("[e] NOTE: disabled motors have no holding torque -- the lift can slide and the "
+                       "logical position would then be wrong. Re-position by hand before re-enabling.");
+      }
       break;
     }
+
+    case 'r':
+      Serial.println("[r] re-running driver config. Position is NOT re-homed: make sure pan/lift "
+                     "are where the firmware thinks they are ('d' shows the position).");
+      BringUpDrivers();
+      break;
 
     case 'd': {
       AxisFeedback lr, ud;
@@ -1740,6 +1950,7 @@ static void ConsoleExecute(const char *line) {
       Serial.printf("    accel %.2f %.2f %.2f m/s2  gyro %.4f %.4f %.4f rad/s  temp %.1f C  samples %lu  errors %lu\n",
                     (double)e.ax, (double)e.ay, (double)e.az, (double)e.gx, (double)e.gy, (double)e.gz,
                     (double)e.tempC, (unsigned long)e.samples, (unsigned long)e.readErrors);
+      if (e.consecutiveErrors) Serial.printf("    ** last %u samples rejected (I2C error / implausible) **\n", e.consecutiveErrors);
       Serial.printf("    pan mode %s (tracking %s)\n", g_panMode == PAN_MODE_TRACK ? "TRACK" : "MANUAL",
                     g_panTrackEnabled ? "enabled" : "disabled");
       break;
@@ -1832,6 +2043,12 @@ void setup() {
   // -------------------- SAFE OUTPUT STATE FIRST --------------------
   // Order matters: drivers disabled, strips dark, light bars at 0 -- before
   // anything that can take time or fail (USB, I2C, UART).
+  // LIMIT: this is the first code the sketch can run. Before it, the ROM
+  // bootloader and the core's double-tap detector (variant.cpp, a ~0.9 s
+  // RGB fade in a static constructor) leave the GPIOs floating. ~EN is held
+  // HIGH by the module's 20k pull-up, but the 74HCT245 A-inputs (LED data)
+  // and D8 (light-bar PWM) float until here -- see BRINGUP_CHECKLIST.md,
+  // board revision items (pull-down resistors).
 
   // Stepper drivers: ~{EN} HIGH = disabled (see STEPPER DRIVER ENABLES below)
   digitalWrite(PIN_UPDOWN_EN, HIGH);
@@ -1874,31 +2091,14 @@ void setup() {
   InitStepperState();
 
   // -------------------- TMC2209 UART BRING-UP --------------------
-  // Status LED: BLUE while probing, GREEN = both drivers verified,
-  // RED = one or both failed (a failed driver stays disabled).
-  StatusLed(false, false, true);
   Serial1.begin(TMC_UART_BAUD, SERIAL_8N1, PIN_TMC_UART_RX, PIN_TMC_UART_TX);
   driverUpDown.begin();      // no pin/baud side effects on ESP32 (SW_CAPABLE_PLATFORM false)
   driverLeftRight.begin();
 
-  const bool okUD = ConfigureDriver(driverUpDown,    g_drvUD, "UP/DOWN (A2, addr 0)");
-  const bool okLR = ConfigureDriver(driverLeftRight, g_drvLR, "LEFT/RIGHT (A3, addr 1)");
-
   // -------------------- STEPPER DRIVER ENABLES --------------------
   // ~{EN} is active-LOW and was driven HIGH (disabled) at the top of setup().
-  // SAFE POWER-ON: a driver is enabled ONLY after its UART config verified.
-  // A driver that failed stays disabled: its current would otherwise be set
-  // by the module's VREF trimpot, not by firmware.
-  SetDriverEnabled(g_drvUD, PIN_UPDOWN_EN,    okUD);
-  SetDriverEnabled(g_drvLR, PIN_LEFTRIGHT_EN, okLR);
-  if (okUD && okLR) {
-    StatusLed(false, true, false);
-    Serial.println("[TMC] both drivers verified and ENABLED");
-  } else {
-    StatusLed(true, false, false);
-    Serial.printf("[TMC] driver config FAILED (UP/DOWN %s, LEFT/RIGHT %s) -- failed driver(s) left DISABLED\n",
-                  okUD ? "ok" : "FAIL", okLR ? "ok" : "FAIL");
-  }
+  // BringUpDrivers() enables a driver ONLY after its UART config verified.
+  BringUpDrivers();
 
   // Motion engine on core 0 (owns the AccelStepper objects from here on)
   StartStepperTask();
@@ -1912,8 +2112,8 @@ void setup() {
   } else {
     Serial.println("MPU6050 OK -- calibrating gyro bias, keep still ~1 s");
     Wire.setClock(IMU_I2C_CLOCK_HZ);
-    imu.setAccelerometerRange(MPU6050_RANGE_4_G);
-    imu.setGyroRange(MPU6050_RANGE_500_DEG);
+    imu.setAccelerometerRange(MPU6050_RANGE_4_G);     // must match IMU_ACCEL_LSB_PER_G
+    imu.setGyroRange(MPU6050_RANGE_500_DEG);          // must match IMU_GYRO_LSB_PER_DPS
     imu.setFilterBandwidth(MPU6050_BAND_21_HZ);
     g_imu.present = true;
     StartImuTask();   // the IMU task owns Wire/imu from here on
@@ -1970,6 +2170,9 @@ void loop() {
 
   // -------------------- 1) INPUTS --------------------
   UpdateInputs(nowMs);
+
+  // Driver health: disable any driver that stopped answering or lost config
+  CheckDriverHealth(nowMs);
 
   // -------------------- 2) ONE-SHOT STATE UPDATES --------------------
   // Brightness button (PB1) cycles discrete brightness levels

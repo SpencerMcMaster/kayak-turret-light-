@@ -15,7 +15,8 @@ Work top to bottom. Do not start a stage until the previous one passes.
 | 2 | **GY-521 I²C pull-up rail** (3.3 V or 5 V?) | Stage 2 (before the Nano is fitted) | Measure in Stage 2, step 2.4 |
 | 3 | **Level shifter part**: netlist value says `74HC245`, build uses SN74HCT245N | Stage 6 strips | Read the chip marking. It must say **HCT**. An HC part at 5 V needs VIH ≥ 3.5 V, and 3.3 V drive is out of spec |
 | 4 | **Unidentified pot-like part on the TMC2209 module** | Nothing (UART mode ignores it). See note | See [Open item 4](#open-item-4--the-pot-like-part-on-the-tmc2209-v13) |
-| 5 | **No homing yet**: pan must be at full LEFT and lift at full DOWN at power-on | Stage 5 soft limits | Position by hand before every power-on until StallGuard homing is tuned |
+| 5 | **No homing yet**: pan must be at full LEFT and lift at full DOWN at power-on | Stage 4 soft limits | Position by hand before every power-on until StallGuard homing is tuned |
+| 6 | **Outputs float before `setup()`** (ROM bootloader + ~0.9 s core double-tap fade): LED data inputs on U1 and D8 are undriven | Board revision | See [Board revision items](#board-revision-items) |
 
 ---
 
@@ -32,7 +33,7 @@ Work top to bottom. Do not start a stage until the previous one passes.
 |---|---|
 | RGB LED at boot | **Blue** briefly, then **red** (no drivers present) |
 | Serial | `[TMC] UP/DOWN (A2, addr 0): test_connection = 2 (NO REPLY ...)`, same for LEFT/RIGHT, `driver config FAILED ... left DISABLED`, `MPU6050 NOT DETECTED`, `Setup complete` |
-| `?` | Menu lists `? e d s i b p t` |
+| `?` | Menu lists `? e d r s i b p t` |
 | `e` | `refused: config not verified` for both |
 | DMM: D2 and D5 to GND | **3.3 V** (~EN HIGH = disabled) |
 | DMM: D8 to GND | **0 V** (light-bar PWM 0) |
@@ -114,6 +115,8 @@ MPU6050 OK -- calibrating gyro bias, keep still ~1 s
 ```
 `d` must show, for **each** driver: `test_connection : 0 (OK)`, `config : VERIFIED (IFCNT 21/21 at boot)`, `~EN pin : LOW (enabled)`, `microsteps=16`, `rms_current(set)=795 mA`, `stealth=1`, `stst=1`, `ot=0 otpw=0 s2ga=0 s2gb=0`. `ola=1 olb=1` (open load) is **expected with no motor connected**.
 
+`d` takes about 0.1–0.3 s (many UART reads). The buttons are not sampled during that time, so don't run it while jogging.
+
 **Fail modes:** `test_connection = 2 (NO REPLY)` → open item 1 (TX path), wrong address, or no 12 V on VS (the TMC2209 logic is powered from VS). `= 1 (0xFFFFFFFF)` → bus stuck HIGH. `writes n/21` with n < 21 → UART bit errors (check the series resistor value and wiring).
 
 ---
@@ -133,7 +136,8 @@ Hand-position pan at **full LEFT** and lift at **full DOWN** (open item 5), conn
 | Mark the pan at 0 and at `LR_STEP_LIMIT` | Arc **≤ 180°**. If larger, lower `LR_STEP_LIMIT` |
 | Wrong direction | Swap one coil pair at J3/J4, or set the DIR polarity in firmware |
 | Motor case after 5 min holding | Warm, not too hot to touch (< ~60 °C) |
-| `e` | Both disable (EN 3.3 V, motors go limp; **the lift may drop under load**), `e` again re-enables |
+| `e` | Both disable (EN 3.3 V, motors go limp; **the lift may drop under load**, and the firmware's position is then wrong: re-position by hand), `e` again re-enables |
+| **12 V dropout with USB still connected**: switch the 12 V supply off for 2 s, then back on | Within 0.25 s: `[TMC] ... FAULT: no reply or config lost ... DISABLED`, LED **red**, EN pins **3.3 V**, and they **stay** 3.3 V when 12 V returns (the motors must not energise). Then `r` → green, EN 0 V |
 
 ---
 
@@ -144,6 +148,7 @@ Hand-position pan at **full LEFT** and lift at **full DOWN** (open item 5), conn
 | Boot | All strips dark until `Setup complete`, then nav lights at the lowest level |
 | `b` at boot | `lit 600/600 (1.000) x applied 16/255 = 0.0627` |
 | Click BRIGHTNESS to the top level, `b` | `requested 220 ... applied 51 ... = 0.2000 ** LIMITED **` |
+| Brightness levels in all-lit modes (nav, flood, pulse) | **Expected:** levels 2, 3 and 4 (requested 84/152/220) all show at applied 51, so only level 1 (16) looks different. That is the 0.20 budget doing its job, not a button fault. If you want four visible steps there, the levels have to sit at or below 51 |
 | MODE through every mode, `b` each time | `product` **≤ 0.2000** always |
 | Strip supply current (clamp meter), white flood at top level | Record it. It must not exceed ≈ 20 % of the strips' rated full-white current |
 | Colour order | Bottom Left red, Bottom Right green, cockpit white. If wrong, change `NEO_GRBW` ↔ `NEO_RGBW` |
@@ -215,6 +220,12 @@ It is almost certainly the **VREF trimmer**: the small square trimpot with a cro
 **Why it does not matter in this firmware:** `I_scale_analog` is written **0** and read back, so the current comes from the internal reference and IRUN/IHOLD only. The trimpot setting has no effect in UART mode. It would only set the current if a module ran standalone, and the firmware never enables a driver whose UART config failed. Still turn it to mid-range so that a module moved into another, standalone machine starts at a sane current.
 
 ---
+
+## Board revision items
+
+* **Pull-downs on the LED data inputs and the PWM output.** 10 kΩ to GND on U1 A0–A3 (pins 2–5) and on J2.5 / D8. Until `setup()` runs (ROM bootloader, then the core's ~0.9 s double-tap RGB fade), these pins float. Floating HCT inputs can clock random data into the SK6812s, at any brightness and outside the power budget, and can half-turn-on the light-bar MOSFET. Firmware cannot run earlier than this. Until the board is revised, power the strips **after** the Nano has booted (RGB LED green or red).
+* **Tie the unused 74HCT245 inputs A4–A7 (pins 6–9) to GND.** They are floating CMOS inputs.
+* **UART:** add a 1 kΩ in series from D1 to the UART_RX net, and leave the module TX pins unconnected (see Open item 1, option C).
 
 ## What "done" looks like
 
