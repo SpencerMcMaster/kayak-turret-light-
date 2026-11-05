@@ -1,0 +1,509 @@
+// ============================================================================
+//  KAYAK UNDERGLOW + COCKPIT LIGHTING CONTROLLER
+//  Board: Arduino Nano ESP32-S3
+//  LEDs:  4 x 12V SK6812 RGBW strips via SN74HCT245 level shifter
+//         (driven as RGB using FastLED's CRGB type)
+//  IMU :  GY-521 (MPU6050) over I2C using Adafruit_MPU6050
+//  Extra: MOSFET PWM channel for a 12 V white light bar
+//
+//  NOTE: This is written to be easy to modify. Expect to tune thresholds,
+//        colors, and LED counts once the kayak is wired and on the water.
+// ============================================================================
+
+#include <Arduino.h>
+#include <math.h>
+
+// ---- FASTLED SETUP ---------------------------------------------------------
+#include <FastLED.h>
+
+// ---- IMU SETUP (GY-521 / MPU6050) using Adafruit library ------------------
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// ============================================================================
+//  PIN ASSIGNMENTS – MATCHED TO YOUR FINAL WIRING
+// ============================================================================
+
+// --- LED strip data pins (after SN74HCT245 level shifter) -------------------
+// Nano pin -> SN74HCT245 A-pin -> B-pin -> 330Ω -> SK6812 DIN
+
+const uint8_t LED_PIN_BOTTOM_LEFT   = 12;  // D12  -> A1 -> B1 -> 330Ω -> Bottom Left DIN
+const uint8_t LED_PIN_BOTTOM_RIGHT  = 11;  // D11  -> A2 -> B2 -> 330Ω -> Bottom Right DIN
+const uint8_t LED_PIN_COCKPIT_FRONT = 10;  // D10  -> A3 -> B3 -> 330Ω -> Cockpit Front DIN
+const uint8_t LED_PIN_COCKPIT_BACK  = 9;  // D9  -> A4 -> B4 -> 330Ω -> Cockpit Back DIN
+
+// --- MOSFET PWM pin for 12 V light bar -------------------------------------
+const uint8_t LIGHTBAR_PWM_PIN      = 8;  // D8 -> MOSFET module PWM/TRIG input
+
+// We'll drive this with ESP32's ledc (hardware PWM)
+const uint8_t  LIGHTBAR_PWM_CHANNEL  = 0;
+const uint16_t LIGHTBAR_PWM_FREQ     = 20000; // 20 kHz, above human hearing
+const uint8_t  LIGHTBAR_PWM_RES_BITS = 8;     // 0–255 duty
+
+// --- I2C pins for GY-521 (MPU6050) -----------------------------------------
+const uint8_t I2C_SDA_PIN           = A4;   // SDA -> GY-521 SDA
+const uint8_t I2C_SCL_PIN           = A5;   // SCL -> GY-521 SCL
+
+// ============================================================================
+//  LED STRIP CONFIGURATION
+// ============================================================================
+
+// NOTE: These LED counts are estimates based on 14' @ 60 LED/m and ~2'9.6".
+//       Adjust them after you physically cut/measure the strips.
+
+const uint16_t NUM_BOTTOM_LEFT   = 256;  // 14 ft ≈ 4.27 m * 60 ≈ 256 LEDs
+const uint16_t NUM_BOTTOM_RIGHT  = 256;
+const uint16_t NUM_COCKPIT_FRONT = 44;   // ~0.85 m * 60 ≈ 51–52 LEDs
+const uint16_t NUM_COCKPIT_BACK  = 44;
+
+// LED type and color order for SK6812 strips.
+// Many SK6812 behave like GRB when driven as RGB.
+// If colors look wrong, try RGB, BRG, etc.
+#define LED_TYPE    SK6812
+#define COLOR_ORDER GRB
+
+// We’ll use CRGB (RGB) not CRGBW, to avoid the RGBW FastLED extension issues.
+CRGB bottomLeftLeds  [NUM_BOTTOM_LEFT];
+CRGB bottomRightLeds [NUM_BOTTOM_RIGHT];
+CRGB cockpitFrontLeds[NUM_COCKPIT_FRONT];
+CRGB cockpitBackLeds [NUM_COCKPIT_BACK];
+
+// Global brightness (0–255). You can change this at runtime if desired.
+uint8_t globalBrightness = 128;  // ~50%
+
+// ============================================================================
+//  IMU / MOTION STATE CONFIG (Adafruit_MPU6050)
+// ============================================================================
+
+Adafruit_MPU6050 mpu;
+
+// Simple motion state machine
+enum KayakState {
+  STATE_IDLE,       // floating, gentle roll
+  STATE_COASTING,   // moderate smooth motion
+  STATE_PEDALING,   // strong regular motion
+  STATE_TURNING     // sharp turn
+};
+
+KayakState currentState = STATE_IDLE;
+
+// Filtered motion metrics
+float rollDeg  = 0.0f;   // degrees
+float pitchDeg = 0.0f;   // degrees
+float yawRate  = 0.0f;   // deg/s approximate
+float motionMagnitude = 0.0f;   // combined gyro magnitude
+
+// Thresholds (these are guesses; tune on the water)
+const float TURN_RATE_THRESHOLD    = 40.0f;  // deg/s yaw for "sharp turn"
+const float PEDAL_MOTION_THRESHOLD = 80.0f;  // overall gyro mag for "pedaling"
+const float COAST_MOTION_THRESHOLD = 20.0f;  // between idle and coast
+
+// Smoothing factor for low-pass filtering
+const float FILTER_ALPHA = 0.1f;
+
+// ============================================================================
+//  TIMING HELPERS
+// ============================================================================
+
+unsigned long lastIMUUpdateMs   = 0;
+const unsigned long IMU_PERIOD  = 10;    // update IMU every 10 ms
+
+unsigned long lastAnimUpdateMs  = 0;
+const unsigned long ANIM_PERIOD = 20;    // update animations every 20 ms
+
+// ============================================================================
+//  FORWARD DECLARATIONS
+// ============================================================================
+
+void initLEDs();
+void initIMU();
+void initPWM();
+
+void updateIMU();
+void updateState();
+void updateAnimations();
+
+void setLightbar(float level); // 0.0–1.0
+
+// Animation helpers for each state
+void animateIdle();
+void animateCoasting();
+void animatePedaling();
+void animateTurning();
+
+// Utility animation helpers
+void clearAllStrips();
+void showAll();
+
+// ----------------------------------------------------------------------------
+//  SETUP
+// ----------------------------------------------------------------------------
+
+void setup() {
+  delay(500);  // let power rails settle
+
+  Serial.begin(115200);
+  delay(100);
+
+  initLEDs();
+  initPWM();
+  initIMU();
+
+  Serial.println(F("Kayak lighting controller started."));
+}
+
+// ----------------------------------------------------------------------------
+//  LOOP
+// ----------------------------------------------------------------------------
+
+void loop() {
+  unsigned long now = millis();
+
+  // --- IMU update at fixed rate ---------------------------------------------
+  if (now - lastIMUUpdateMs >= IMU_PERIOD) {
+    lastIMUUpdateMs = now;
+    updateIMU();
+    updateState();
+  }
+
+  // --- Animation update ------------------------------------------------------
+  if (now - lastAnimUpdateMs >= ANIM_PERIOD) {
+    lastAnimUpdateMs = now;
+    updateAnimations();
+  }
+
+  // LED updates are done inside updateAnimations() via showAll().
+}
+
+// ============================================================================
+//  INITIALIZATION FUNCTIONS
+// ============================================================================
+
+void initLEDs() {
+  // Tell FastLED we’re using RGB strips.
+  FastLED.addLeds<LED_TYPE, LED_PIN_BOTTOM_LEFT,   COLOR_ORDER>(
+      bottomLeftLeds, NUM_BOTTOM_LEFT);
+  FastLED.addLeds<LED_TYPE, LED_PIN_BOTTOM_RIGHT,  COLOR_ORDER>(
+      bottomRightLeds, NUM_BOTTOM_RIGHT);
+  FastLED.addLeds<LED_TYPE, LED_PIN_COCKPIT_FRONT, COLOR_ORDER>(
+      cockpitFrontLeds, NUM_COCKPIT_FRONT);
+  FastLED.addLeds<LED_TYPE, LED_PIN_COCKPIT_BACK,  COLOR_ORDER>(
+      cockpitBackLeds, NUM_COCKPIT_BACK);
+
+  FastLED.setBrightness(globalBrightness);
+
+  clearAllStrips();
+  FastLED.show();
+}
+
+void initPWM() {
+  // Configure ESP32-S3 hardware PWM for the light bar.
+  ledcSetup(LIGHTBAR_PWM_CHANNEL, LIGHTBAR_PWM_FREQ, LIGHTBAR_PWM_RES_BITS);
+  ledcAttachPin(LIGHTBAR_PWM_PIN, LIGHTBAR_PWM_CHANNEL);
+
+  // Start with light bar off.
+  setLightbar(0.0f);
+}
+
+void initIMU() {
+  // Initialize I2C on the pins we wired (A4/A5).
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  Serial.println(F("Initializing Adafruit MPU6050..."));
+  if (!mpu.begin()) {
+    Serial.println(F("Failed to find MPU6050 chip! Check wiring."));
+    // We can continue, but state machine will be kinda blind.
+  } else {
+    Serial.println(F("MPU6050 found."));
+
+    // Configure ranges and filtering for a kayak use-case.
+    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+
+  delay(500);
+}
+
+// ============================================================================
+//  IMU + STATE MACHINE
+// ============================================================================
+
+void updateIMU() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+  // -------------------------------------------
+  // Compute roll and pitch from accelerometer
+  // -------------------------------------------
+  // roll  ≈ atan2(accY, accZ)
+  // pitch ≈ atan2(-accX, sqrt(accY^2 + accZ^2))
+
+  float ax = a.acceleration.x;
+  float ay = a.acceleration.y;
+  float az = a.acceleration.z;
+
+  float newRoll  = atan2f(ay, az) * 57.2958f;  // rad->deg
+  float newPitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 57.2958f;
+
+  // Gyro data is in rad/s from Adafruit library; convert to deg/s
+  float gx = g.gyro.x * 57.2958f;
+  float gy = g.gyro.y * 57.2958f;
+  float gz = g.gyro.z * 57.2958f;   // use as yawRate estimate
+
+  // Low-pass filter everything
+  rollDeg  = rollDeg  + FILTER_ALPHA * (newRoll  - rollDeg);
+  pitchDeg = pitchDeg + FILTER_ALPHA * (newPitch - pitchDeg);
+  yawRate  = yawRate  + FILTER_ALPHA * (gz       - yawRate);
+
+  // Combined motion magnitude (rough heuristic)
+  float mag = fabsf(gx) + fabsf(gy) + fabsf(gz);
+  motionMagnitude = motionMagnitude + FILTER_ALPHA * (mag - motionMagnitude);
+}
+
+void updateState() {
+  KayakState newState = currentState;
+
+  // Sharp turn has highest priority: large yaw rate
+  if (fabsf(yawRate) > TURN_RATE_THRESHOLD) {
+    newState = STATE_TURNING;
+  }
+  // Strong motion but not heavy yaw = pedaling
+  else if (motionMagnitude > PEDAL_MOTION_THRESHOLD) {
+    newState = STATE_PEDALING;
+  }
+  // Moderate motion = coasting
+  else if (motionMagnitude > COAST_MOTION_THRESHOLD) {
+    newState = STATE_COASTING;
+  }
+  // Very low motion = idle
+  else {
+    newState = STATE_IDLE;
+  }
+
+  if (newState != currentState) {
+    currentState = newState;
+    Serial.print(F("State changed to: "));
+    switch (currentState) {
+      case STATE_IDLE:      Serial.println(F("IDLE"));      break;
+      case STATE_COASTING:  Serial.println(F("COASTING"));  break;
+      case STATE_PEDALING:  Serial.println(F("PEDALING"));  break;
+      case STATE_TURNING:   Serial.println(F("TURNING"));   break;
+    }
+  }
+}
+
+// ============================================================================
+//  ANIMATIONS
+// ============================================================================
+
+void updateAnimations() {
+  switch (currentState) {
+    case STATE_IDLE:
+      animateIdle();
+      break;
+
+    case STATE_COASTING:
+      animateCoasting();
+      break;
+
+    case STATE_PEDALING:
+      animatePedaling();
+      break;
+
+    case STATE_TURNING:
+      animateTurning();
+      break;
+  }
+
+  showAll();
+}
+
+// --- Helper: clear all LEDs (but does not call show()) ----------------------
+
+void clearAllStrips() {
+  for (uint16_t i = 0; i < NUM_BOTTOM_LEFT;   i++) bottomLeftLeds[i]  = CRGB::Black;
+  for (uint16_t i = 0; i < NUM_BOTTOM_RIGHT;  i++) bottomRightLeds[i] = CRGB::Black;
+  for (uint16_t i = 0; i < NUM_COCKPIT_FRONT; i++) cockpitFrontLeds[i]= CRGB::Black;
+  for (uint16_t i = 0; i < NUM_COCKPIT_BACK;  i++) cockpitBackLeds[i] = CRGB::Black;
+}
+
+void showAll() {
+  FastLED.show();
+}
+
+// ----------------------------------------------------------------------------
+//  STATE: IDLE  (kayak floating, gentle roll)
+// ----------------------------------------------------------------------------
+// Cockpit: bubble-level effect around roll angle
+// Bottom : slow twinkle reacting to subtle motion
+// Lightbar: off
+// ----------------------------------------------------------------------------
+
+void animateIdle() {
+  clearAllStrips();
+
+  // --- Cockpit bubble-level simulation -------------------------------------
+  // Map roll angle (-20°..+20°) to an index along the cockpit strips.
+  float clampedRoll = constrain(rollDeg, -20.0f, 20.0f);
+  float norm = (clampedRoll + 20.0f) / 40.0f; // 0..1
+  uint16_t idxFront = (uint16_t)(norm * (NUM_COCKPIT_FRONT - 1));
+  uint16_t idxBack  = (uint16_t)(norm * (NUM_COCKPIT_BACK  - 1));
+
+  // Dim blue-ish bubble
+  CRGB bubbleColor = CRGB(0, 40, 80); // mostly blue with some green
+
+  cockpitFrontLeds[idxFront] = bubbleColor;
+  cockpitBackLeds[idxBack]   = bubbleColor;
+
+  // Soften with neighboring LEDs
+  if (idxFront > 0)  cockpitFrontLeds[idxFront - 1] = bubbleColor.nscale8(80);
+  if (idxFront < NUM_COCKPIT_FRONT - 1) cockpitFrontLeds[idxFront + 1] = bubbleColor.nscale8(80);
+  if (idxBack  > 0)  cockpitBackLeds[idxBack - 1]   = bubbleColor.nscale8(80);
+  if (idxBack  < NUM_COCKPIT_BACK - 1) cockpitBackLeds[idxBack + 1]   = bubbleColor.nscale8(80);
+
+  // --- Bottom – slow twinkle based on small motion -------------------------
+  uint8_t twinkleChance = map((int)motionMagnitude, 0, (int)COAST_MOTION_THRESHOLD, 5, 20);
+  twinkleChance = constrain(twinkleChance, 5, 20);
+
+  for (uint16_t i = 0; i < NUM_BOTTOM_LEFT; i++) {
+    bottomLeftLeds[i].fadeToBlackBy(5);
+    if (random8() < twinkleChance) {
+      bottomLeftLeds[i] = CRGB(0, 30, 80); // soft aqua
+    }
+  }
+  for (uint16_t i = 0; i < NUM_BOTTOM_RIGHT; i++) {
+    bottomRightLeds[i].fadeToBlackBy(5);
+    if (random8() < twinkleChance) {
+      bottomRightLeds[i] = CRGB(0, 30, 80);
+    }
+  }
+
+  // Lightbar off in idle
+  setLightbar(0.0f);
+}
+
+// ----------------------------------------------------------------------------
+//  STATE: COASTING  (moderate smooth forward motion)
+// ----------------------------------------------------------------------------
+// Cockpit: dim red with ends even dimmer.
+// Bottom : "plankton" effect – twinkles that appear to flow past.
+// Lightbar: low level (here ~25%)
+// ----------------------------------------------------------------------------
+
+void animateCoasting() {
+  clearAllStrips();
+
+  // --- Cockpit: dim red gradient -------------------------------------------
+  for (uint16_t i = 0; i < NUM_COCKPIT_FRONT; i++) {
+    float pos = (float)i / (NUM_COCKPIT_FRONT - 1);
+    uint8_t base = 40;        // center brightness
+    uint8_t edgeDrop = 20;    // ends are base - edgeDrop
+    uint8_t r = base - (uint8_t)(edgeDrop * fabsf(pos - 0.5f) * 2.0f);
+    cockpitFrontLeds[i] = CRGB(r, 0, 0);
+  }
+  for (uint16_t i = 0; i < NUM_COCKPIT_BACK; i++) {
+    float pos = (float)i / (NUM_COCKPIT_BACK - 1);
+    uint8_t base = 40;
+    uint8_t edgeDrop = 20;
+    uint8_t r = base - (uint8_t)(edgeDrop * fabsf(pos - 0.5f) * 2.0f);
+    cockpitBackLeds[i] = CRGB(r, 0, 0);
+  }
+
+  // --- Bottom: bioluminescent plankton illusion ----------------------------
+  static uint16_t offsetBL = 0;
+  static uint16_t offsetBR = 0;
+
+  offsetBL++;
+  offsetBR++;
+
+  for (uint16_t i = 0; i < NUM_BOTTOM_LEFT; i++) {
+    uint16_t idx = (i + offsetBL) % NUM_BOTTOM_LEFT;
+    bottomLeftLeds[idx].fadeToBlackBy(10);
+    if (random8() < 10) {
+      bottomLeftLeds[idx] = CRGB(0, 50, 120); // brighter aqua
+    }
+  }
+  for (uint16_t i = 0; i < NUM_BOTTOM_RIGHT; i++) {
+    uint16_t idx = (i + offsetBR) % NUM_BOTTOM_RIGHT;
+    bottomRightLeds[idx].fadeToBlackBy(10);
+    if (random8() < 10) {
+      bottomRightLeds[idx] = CRGB(0, 50, 120);
+    }
+  }
+
+  // Lightbar at low level while coasting
+  setLightbar(0.25f);
+}
+
+// ----------------------------------------------------------------------------
+//  STATE: PEDALING (Hobie Mirage drives engaged)
+// ----------------------------------------------------------------------------
+// Cockpit: low/medium white brightness.
+// Bottom : completely off.
+// Lightbar: medium brightness.
+// ----------------------------------------------------------------------------
+
+void animatePedaling() {
+  clearAllStrips();
+
+  // Cockpit solid soft white (RGB white since we don't use W channel)
+  CRGB whiteCockpit = CRGB(180, 180, 180);
+
+  for (uint16_t i = 0; i < NUM_COCKPIT_FRONT; i++) {
+    cockpitFrontLeds[i] = whiteCockpit;
+  }
+  for (uint16_t i = 0; i < NUM_COCKPIT_BACK; i++) {
+    cockpitBackLeds[i] = whiteCockpit;
+  }
+
+  // Bottom strips OFF in this mode.
+
+  // Lightbar medium brightness
+  setLightbar(0.6f);
+}
+
+// ----------------------------------------------------------------------------
+//  STATE: TURNING (sharp turn)
+// ----------------------------------------------------------------------------
+// Cockpit: off completely.
+// Bottom : solid color to emphasize turn.
+// Lightbar: off (so bottom glow dominates).
+// ----------------------------------------------------------------------------
+
+void animateTurning() {
+  clearAllStrips();
+
+  CRGB turnColor = CRGB(0, 80, 150); // bright cyan
+
+  for (uint16_t i = 0; i < NUM_BOTTOM_LEFT; i++) {
+    bottomLeftLeds[i] = turnColor;
+  }
+  for (uint16_t i = 0; i < NUM_BOTTOM_RIGHT; i++) {
+    bottomRightLeds[i] = turnColor;
+  }
+
+  // Cockpit remains off.
+
+  setLightbar(0.0f);
+}
+
+// ============================================================================
+//  LIGHTBAR PWM HELPER
+// ============================================================================
+
+void setLightbar(float level) {
+  // Clamp to 0.0–1.0 range
+  if (level < 0.0f) level = 0.0f;
+  if (level > 1.0f) level = 1.0f;
+
+  uint16_t maxDuty = (1 << LIGHTBAR_PWM_RES_BITS) - 1;
+  uint16_t duty    = (uint16_t)(level * maxDuty + 0.5f);
+
+  ledcWrite(LIGHTBAR_PWM_CHANNEL, duty);
+}
+
+// ============================================================================
+//  END OF FILE
+// ============================================================================
