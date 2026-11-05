@@ -13,7 +13,7 @@ def between(a, b):
     i = s.index(a); j = s.index(b, i); return s[i:j]
 parts = [
     between("// Bytes per pixel, decoded", "// Global brightness limits"),
-    between("static const float LED_POWER_BUDGET_MAX", "// ====="),
+    between("static const float LED_POWER_BUDGET_MAX", "// -------------------- ANIMATION TIMING"),
     between("// -------------------- POWER BUDGET STATE", "// -------------------- TURN / HAZARD STATE"),
     between("// -------------------- LED POWER BUDGET --------------------", "static uint8_t BrightnessFromIndex"),
 ]
