@@ -3,6 +3,16 @@
 Firmware: `kayak_working/kayak_working.ino` · Netlist: `kayak working.txt` (KiCad 9.0.6 netlist, rev 2.0)
 
 Work top to bottom. Do not start a stage until the previous one passes.
+
+**Standalone bench sketches** (`bench_tests/`, see its README) test one subsystem each and are the quickest way through the early stages:
+
+| Stage | Flash this first | Then |
+|---|---|---|
+| 3 (first boot on the PCB) | `test_buttons` (USB power is enough), then `test_imu` (needs 12 V, and the Stage 2.4 pull-up check passed), then `test_tmc_uart` (never enables a driver) | `kayak_working` boot checks |
+| 4 | `test_motor`, `TEST_AXIS` 0 then 1 | `kayak_working` jog / chord / limit checks |
+| 5 | `test_led_strip`, `TEST_STRIP` 0–3 | `kayak_working` budget checks |
+| 6 | `test_lightbar` | `kayak_working` lift-gated light bars |
+| 7–8 | — | `kayak_working` IMU / tracking |
 **Never plug or unplug a stepper motor while 12 V is on** (TMC2209 output stage damage).
 
 ---
