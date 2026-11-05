@@ -1,0 +1,420 @@
+/*
+  Kayak Light Bar Controller
+  Board: Arduino Nano ESP32-S3
+  LEDs:  SK6812 RGBW 12V strip via SN74HCT245N + 330-470R series resistor
+  Work Lights: 3 x 12V bars via high-power MOSFET modules
+  IMU:  GY-521 MPU6050 (I2C)
+  UI:   2 waterproof pushbuttons (mode & brightness)
+  Future: Limit switches + steppers (placeholders only)
+
+  Required Libraries:
+    - Adafruit NeoPixel
+    - Adafruit MPU6050
+    - Adafruit Unified Sensor
+*/
+
+#include <Wire.h>
+#include <Adafruit_NeoPixel.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+
+// ================== USER CONFIGURABLE PINS =====================
+#define LED_DATA_PIN           5    // To SN74HCT245N input (then through 330–470R to SK6812 DIN)
+#define MOSFET_SPOT_PIN        9    // Center 7" spot bar
+#define MOSFET_FLOOD_LEFT_PIN  10   // Left flood bar
+#define MOSFET_FLOOD_RIGHT_PIN 11   // Right flood bar
+
+#define BUTTON_MODE_PIN        6    // Waterproof button #1 - cycles modes
+#define BUTTON_BRIGHT_PIN      7    // Waterproof button #2 - cycles brightness levels
+
+#define LIMIT_LIFT_TOP_PIN     2    // OpenBuilds switch - future use
+#define LIMIT_LIFT_BOTTOM_PIN  3
+#define LIMIT_ROTATE_HOME_PIN  4
+
+// Number of LEDs on your SK6812 RGBW strip
+#define NUM_LEDS               60   // <-- change to match your strip
+
+// LED power and brightness
+#define LED_MAX_BRIGHTNESS     180  // 0-255; keep below 200 to limit current
+// ===============================================================
+
+
+// ================== TYPEDEFS & GLOBAL OBJECTS ==================
+
+Adafruit_MPU6050 mpu;
+
+// Adafruit_NeoPixel for RGBW strip:
+//   NEO_GRBW + NEO_KHZ800 is correct for SK6812 RGBW
+Adafruit_NeoPixel strip(NUM_LEDS, LED_DATA_PIN, NEO_GRBW + NEO_KHZ800);
+
+// System modes
+enum SystemMode {
+  MODE_ALL_OFF = 0,
+  MODE_NAV,
+  MODE_WORK,
+  MODE_ANIM_IMU,
+  MODE_COUNT              // Keep last
+};
+
+SystemMode currentMode = MODE_ALL_OFF;
+
+// Brightness levels
+const uint8_t BRIGHTNESS_LEVELS[] = {40, 80, 130, LED_MAX_BRIGHTNESS};
+const uint8_t NUM_BRIGHTNESS_LEVELS = sizeof(BRIGHTNESS_LEVELS) / sizeof(BRIGHTNESS_LEVELS[0]);
+uint8_t brightnessIndex = 2;  // start mid-high
+
+// Button debouncing
+struct ButtonState {
+  uint8_t pin;
+  bool lastPhysicalState;
+  bool debouncedState;
+  unsigned long lastChangeTime;
+  unsigned long debounceDelay;
+};
+
+ButtonState btnMode = {BUTTON_MODE_PIN, HIGH, HIGH, 0, 25};
+ButtonState btnBright = {BUTTON_BRIGHT_PIN, HIGH, HIGH, 0, 25};
+
+// Timing
+unsigned long lastLEDUpdate = 0;
+unsigned long lastIMUUpdate = 0;
+unsigned long lastStatusPrint = 0;
+
+// Animation params
+const unsigned long LED_FRAME_INTERVAL = 30;   // ms
+const unsigned long IMU_INTERVAL       = 50;   // ms
+const unsigned long STATUS_INTERVAL    = 2000; // ms
+
+// IMU state
+float rollDeg  = 0.0f;
+float pitchDeg = 0.0f;
+float yawDeg   = 0.0f;
+
+// Simple running average for roll
+float rollFilter = 0.0f;
+const float ROLL_FILTER_ALPHA = 0.15f;
+
+// ====================================================================
+// Utility Functions
+// ====================================================================
+
+void setAllStripPixels(uint8_t r, uint8_t g, uint8_t b, uint8_t w) {
+  for (uint16_t i = 0; i < NUM_LEDS; i++) {
+    strip.setPixelColor(i, strip.Color(r, g, b, w));
+  }
+}
+
+void applyBrightness() {
+  strip.setBrightness(BRIGHTNESS_LEVELS[brightnessIndex]);
+}
+
+// Simple HSV->RGBW approximation (W used for desaturated part)
+void hsvToRgbw(float h, float s, float v, uint8_t &r, uint8_t &g, uint8_t &b, uint8_t &w) {
+  // h: 0-360, s:0-1, v:0-1
+  float C = v * s;
+  float X = C * (1 - fabs(fmod(h / 60.0, 2) - 1));
+  float m = v - C;
+
+  float r1 = 0, g1 = 0, b1 = 0;
+  if (h < 60)      { r1 = C; g1 = X; b1 = 0; }
+  else if (h < 120){ r1 = X; g1 = C; b1 = 0; }
+  else if (h < 180){ r1 = 0; g1 = C; b1 = X; }
+  else if (h < 240){ r1 = 0; g1 = X; b1 = C; }
+  else if (h < 300){ r1 = X; g1 = 0; b1 = C; }
+  else             { r1 = C; g1 = 0; b1 = X; }
+
+  // Convert to 0-255
+  uint8_t R = (uint8_t)((r1 + m) * 255);
+  uint8_t G = (uint8_t)((g1 + m) * 255);
+  uint8_t B = (uint8_t)((b1 + m) * 255);
+
+  // Use W as "common" brightness - simplistic
+  uint8_t minRGB = min(R, min(G, B));
+  w = minRGB;
+  r = R - w;
+  g = G - w;
+  b = B - w;
+}
+
+// ====================================================================
+// Button Handling
+// ====================================================================
+
+bool updateButton(ButtonState &btn) {
+  bool physical = digitalRead(btn.pin);
+
+  if (physical != btn.lastPhysicalState) {
+    btn.lastChangeTime = millis();
+    btn.lastPhysicalState = physical;
+  }
+
+  if ((millis() - btn.lastChangeTime) > btn.debounceDelay) {
+    if (btn.debouncedState != physical) {
+      btn.debouncedState = physical;
+      // Return true on HIGH->LOW transition (button press if active-low)
+      if (physical == LOW) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// ====================================================================
+// IMU Handling
+// ====================================================================
+
+// Compute roll/pitch from accelerometer only (simple, good enough here)
+void computeOrientationFromAccel(sensors_event_t &accel) {
+  float ax = accel.acceleration.x;
+  float ay = accel.acceleration.y;
+  float az = accel.acceleration.z;
+
+  // roll: rotation around x-axis
+  rollDeg = atan2(ay, az) * 180.0 / PI;
+
+  // pitch: rotation around y-axis
+  pitchDeg = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+}
+
+void updateIMU() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  computeOrientationFromAccel(a);
+
+  // low-pass filter on roll
+  rollFilter = (1.0f - ROLL_FILTER_ALPHA) * rollFilter + ROLL_FILTER_ALPHA * rollDeg;
+}
+
+// ====================================================================
+// LED Animations
+// ====================================================================
+
+void renderModeAllOff() {
+  setAllStripPixels(0, 0, 0, 0);
+}
+
+void renderModeNav() {
+  // Simple nav idea:
+  //  - First 1/4 strip: red (port)
+  //  - Last 1/4 strip: green (starboard)
+  //  - Middle: low-level warm white
+  uint16_t quarter = NUM_LEDS / 4;
+  uint16_t threeQuarter = NUM_LEDS - quarter;
+
+  for (uint16_t i = 0; i < NUM_LEDS; i++) {
+    if (i < quarter) {
+      // Red
+      strip.setPixelColor(i, strip.Color(255, 0, 0, 0));
+    } else if (i >= threeQuarter) {
+      // Green
+      strip.setPixelColor(i, strip.Color(0, 255, 0, 0));
+    } else {
+      // Warm white in the middle
+      strip.setPixelColor(i, strip.Color(0, 0, 0, 80));
+    }
+  }
+}
+
+void renderModeWork() {
+  // Full-strip bright warm white
+  setAllStripPixels(0, 0, 0, 200);
+}
+
+void renderModeAnimIMU(unsigned long tNow) {
+  // Use filtered roll angle (-90 to +90) to control a hue shift
+  // and a simple back-and-forth "comet" animation
+  float normalized = (rollFilter + 90.0f) / 180.0f;  // 0-1
+  normalized = constrain(normalized, 0.0f, 1.0f);
+  float hue = normalized * 300.0f; // 0-300 deg (avoid purple > 300)
+
+  // Comet position
+  float speed = 0.03f;  // smaller = slower
+  float pos = fmod((float)tNow * speed / 1000.0f, 1.0f); // 0-1
+  uint16_t centerIndex = (uint16_t)(pos * NUM_LEDS);
+
+  // Clear first
+  setAllStripPixels(0, 0, 0, 0);
+
+  // Draw a gradient comet around center index
+  const int radius = 6;
+  for (int16_t offset = -radius; offset <= radius; offset++) {
+    int16_t idx = centerIndex + offset;
+    if (idx < 0 || idx >= (int16_t)NUM_LEDS) continue;
+
+    float dist = fabs(offset) / (float)radius;
+    float brightness = 1.0f - dist;  // 1 at center, fade to 0 at edges
+    brightness = constrain(brightness, 0.0f, 1.0f);
+
+    uint8_t r, g, b, w;
+    hsvToRgbw(hue, 1.0f, brightness, r, g, b, w);
+    strip.setPixelColor(idx, strip.Color(r, g, b, w));
+  }
+}
+
+void updateStrip() {
+  unsigned long now = millis();
+  if (now - lastLEDUpdate < LED_FRAME_INTERVAL) {
+    return;
+  }
+  lastLEDUpdate = now;
+
+  switch (currentMode) {
+    case MODE_ALL_OFF:
+      renderModeAllOff();
+      break;
+
+    case MODE_NAV:
+      renderModeNav();
+      break;
+
+    case MODE_WORK:
+      renderModeWork();
+      break;
+
+    case MODE_ANIM_IMU:
+      renderModeAnimIMU(now);
+      break;
+
+    default:
+      renderModeAllOff();
+      break;
+  }
+
+  applyBrightness();
+  strip.show();
+}
+
+// ====================================================================
+// Work Light Control (MOSFET channels)
+// ====================================================================
+
+void updateWorkLights() {
+  switch (currentMode) {
+    case MODE_ALL_OFF:
+    case MODE_NAV:
+    case MODE_ANIM_IMU:
+      // All work lights off
+      analogWrite(MOSFET_SPOT_PIN, 0);
+      analogWrite(MOSFET_FLOOD_LEFT_PIN, 0);
+      analogWrite(MOSFET_FLOOD_RIGHT_PIN, 0);
+      break;
+
+    case MODE_WORK:
+      // Full-on for now (PWM = 255)
+      analogWrite(MOSFET_SPOT_PIN, 255);
+      analogWrite(MOSFET_FLOOD_LEFT_PIN, 255);
+      analogWrite(MOSFET_FLOOD_RIGHT_PIN, 255);
+      break;
+  }
+}
+
+// ====================================================================
+// Mode & Brightness Handling
+// ====================================================================
+
+void nextMode() {
+  currentMode = (SystemMode)((currentMode + 1) % MODE_COUNT);
+  Serial.print("Mode changed to: ");
+  Serial.println((int)currentMode);
+}
+
+void nextBrightness() {
+  brightnessIndex = (brightnessIndex + 1) % NUM_BRIGHTNESS_LEVELS;
+  Serial.print("Brightness level: ");
+  Serial.print(brightnessIndex);
+  Serial.print(" (");
+  Serial.print(BRIGHTNESS_LEVELS[brightnessIndex]);
+  Serial.println(")");
+}
+
+// ====================================================================
+// Setup
+// ====================================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // Buttons
+  pinMode(BUTTON_MODE_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_BRIGHT_PIN, INPUT_PULLUP);
+
+  // Limit switches (future)
+  pinMode(LIMIT_LIFT_TOP_PIN, INPUT_PULLUP);
+  pinMode(LIMIT_LIFT_BOTTOM_PIN, INPUT_PULLUP);
+  pinMode(LIMIT_ROTATE_HOME_PIN, INPUT_PULLUP);
+
+  // MOSFET outputs
+  pinMode(MOSFET_SPOT_PIN, OUTPUT);
+  pinMode(MOSFET_FLOOD_LEFT_PIN, OUTPUT);
+  pinMode(MOSFET_FLOOD_RIGHT_PIN, OUTPUT);
+  analogWrite(MOSFET_SPOT_PIN, 0);
+  analogWrite(MOSFET_FLOOD_LEFT_PIN, 0);
+  analogWrite(MOSFET_FLOOD_RIGHT_PIN, 0);
+
+  // LED strip
+  strip.begin();
+  strip.show(); // all off
+  strip.setBrightness(BRIGHTNESS_LEVELS[brightnessIndex]);
+
+  // Initialize IMU
+  if (!mpu.begin()) {
+    Serial.println("Failed to find MPU6050 chip! Check wiring.");
+  } else {
+    Serial.println("MPU6050 found.");
+    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  }
+
+  // Initial IMU reading
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  computeOrientationFromAccel(a);
+  rollFilter = rollDeg;
+
+  Serial.println("Setup complete.");
+}
+
+// ====================================================================
+// Main Loop
+// ====================================================================
+
+void loop() {
+  unsigned long now = millis();
+
+  // --- Update buttons ---
+  if (updateButton(btnMode)) {
+    nextMode();
+  }
+
+  if (updateButton(btnBright)) {
+    nextBrightness();
+  }
+
+  // --- Update IMU ---
+  if (now - lastIMUUpdate > IMU_INTERVAL) {
+    lastIMUUpdate = now;
+    updateIMU();
+  }
+
+  // --- Update LEDs ---
+  updateStrip();
+
+  // --- Update work lights ---
+  updateWorkLights();
+
+  // Optional: periodic status print
+  if (now - lastStatusPrint > STATUS_INTERVAL) {
+    lastStatusPrint = now;
+    Serial.print("Roll: ");
+    Serial.print(rollFilter, 1);
+    Serial.print(" deg, Mode: ");
+    Serial.print((int)currentMode);
+    Serial.print(", Brightness: ");
+    Serial.println(BRIGHTNESS_LEVELS[brightnessIndex]);
+  }
+
+  // No delay() → fully non-blocking
+}
