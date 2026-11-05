@@ -9,7 +9,7 @@
 
     - 4x SK6812 RGBW (12V) addressable LED strips
       (driven via SN74HCT245 level shifter + 330Ω series resistors)
-    - 2x TMC2209 stepper motor drivers (STEP/DIR mode)
+    - 2x TMC2209 stepper motor drivers (STEP/DIR motion, UART configuration)
       - Up/Down lift axis
       - Left/Right rotation axis
     - 4x momentary pushbuttons
@@ -67,6 +67,12 @@
 #include <Adafruit_MPU6050.h>                 // GY-521 / MPU6050 IMU
 #include <Adafruit_Sensor.h>                  // Required by Adafruit_MPU6050
 #include <AccelStepper.h>                     // Step/Dir stepper motor control
+#include <TMCStepper.h>                       // TMC2209 UART configuration
+
+// Serial debug console ('?' for help). Set to 0 to compile it out.
+#ifndef DEBUG_CONSOLE
+#define DEBUG_CONSOLE 1
+#endif
 
 
 
@@ -132,8 +138,40 @@ static const long UD_STEP_INCREMENT = 800;
 static const long UD_STEP_LIMIT     = 4000;
 
 // Stepper speed/acceleration (AccelStepper units = steps/sec)
-static const float STEPPER_MAX_SPEED = 2000.0f;
+static const float STEPPER_MAX_SPEED = 2000.0f;   // absolute ceiling for any move
 static const float STEPPER_ACCEL     = 4000.0f;
+
+// Console 's' command: out-and-back test move per axis (steps, within soft limits)
+static const long TEST_JOG_STEPS = 200;
+
+// -------------------- TMC2209 (UART) --------------------
+// HARD SAFETY CONSTRAINT: motors are 1 A rated. Run current <= 800 mA RMS,
+// automatic standstill reduction to ~30 %. Never configure above this.
+static constexpr uint16_t TMC_RUN_CURRENT_MA  = 800;
+static constexpr float    TMC_HOLD_MULTIPLIER = 0.30f;   // IHOLD = 30 % of IRUN
+static_assert(TMC_RUN_CURRENT_MA <= 800, "TMC run current must stay <= 800 mA (1 A motors)");
+static_assert(TMC_HOLD_MULTIPLIER > 0.0f && TMC_HOLD_MULTIPLIER <= 0.5f, "IHOLD must be a reduction");
+
+static const float    TMC_R_SENSE         = 0.11f;   // BTT V1.3 sense resistors R3/R5 = 0R11 (module schematic)
+static const uint32_t TMC_UART_BAUD       = 115200;
+static const uint16_t TMC_MICROSTEPS      = 16;
+static const uint8_t  TMC_TOFF            = 3;       // chopper off time; 0 would disable the output stage
+static const uint8_t  TMC_IHOLDDELAY      = 6;       // ramp IRUN -> IHOLD over 6 x 2^18 clocks
+static const uint8_t  TMC_TPOWERDOWN      = 20;      // standstill -> IHOLD after ~0.44 s (20 x 2^18 / 12 MHz)
+
+// StallGuard4 homing PLACEHOLDERS. 0 = disabled (DIAG only reports driver
+// errors). Tune on the bench before enabling sensorless homing:
+// DIAG goes high when SG_RESULT <= 2 x SGTHRS while TCOOLTHRS >= TSTEP.
+static const uint32_t TMC_TCOOLTHRS       = 0;
+static const uint8_t  TMC_SGTHRS          = 0;
+
+// -------------------- TASKS / SCHEDULING --------------------
+// LED show() blocks ~24 ms for 600 RGBW pixels, so steppers run in their own
+// task on core 0; loop() (core 1) only exchanges commands with it.
+static const uint16_t FRAME_INTERVAL_MS   = 20;      // LED render + show cadence
+static const uint32_t STEPPER_TASK_STACK  = 4096;
+static const UBaseType_t STEPPER_TASK_PRIO = 1;
+static const uint16_t STEPPER_TASK_YIELD_MS = 100;   // let IDLE0 run (task WDT) while moving
 
 // -------------------- INPUT HANDLING --------------------
 // Button debounce time
@@ -211,6 +249,13 @@ static const uint8_t PIN_PB_TURN_RIGHT     = A0;  // GPIO1   net Net-(J6-Pin_4) 
 static const uint8_t PIN_I2C_SDA           = A4;  // GPIO11  net Net-(A1-A4{slash}SDA) -> U2.4 SDA
 static const uint8_t PIN_I2C_SCL           = A5;  // GPIO12  net Net-(A1-A5{slash}SCL) -> U2.3 SCL
 static const uint8_t IMU_I2C_ADDR          = 0x68;
+
+// -------------------- ONBOARD STATUS RGB LED (on the Nano module) --------------------
+// Not on the PCB netlist. Active-LOW. GPIO46 (R), GPIO0 (G), GPIO45 (B) are
+// strapping pins, sampled only at reset; driving them afterwards is fine.
+static const uint8_t PIN_STATUS_LED_R      = LED_RED;    // GPIO46
+static const uint8_t PIN_STATUS_LED_G      = LED_GREEN;  // GPIO0
+static const uint8_t PIN_STATUS_LED_B      = LED_BLUE;   // GPIO45
 
 // -------------------- UNUSED / RESERVED MCU PINS --------------------
 // D13 (GPIO48, SCK/LED_BUILTIN): unconnected-(A1-D13_SCK-PadD13) -- off-limits.
@@ -296,6 +341,13 @@ AccelStepper stepperLeftRight(
   PIN_LEFTRIGHT_STEP,
   PIN_LEFTRIGHT_DIR
 );
+// NOTE: the AccelStepper objects are owned by the stepper task (core 0).
+// Nothing else may call their methods once that task is running.
+
+// -------------------- TMC2209 UART DRIVERS --------------------
+// One shared single-wire UART bus (Serial1), addressed by MS1/MS2 tie-offs.
+TMC2209Stepper driverUpDown   (&Serial1, TMC_R_SENSE, TMC_ADDR_UPDOWN);
+TMC2209Stepper driverLeftRight(&Serial1, TMC_R_SENSE, TMC_ADDR_LEFTRIGHT);
 
 // ============================================================================
 // END OF GLOBAL HARDWARE OBJECTS
@@ -379,6 +431,60 @@ static float g_udJogSpeed = 0.0f;
 // For now we keep them defined to support future expansion.
 static bool g_liftUpHeld   = false;
 static bool g_liftDownHeld = false;
+
+// -------------------- TMC2209 STATUS --------------------
+struct DriverStatus {
+  bool    configOk;      // UART config written AND verified
+  bool    enabled;       // ~{EN} currently driven LOW
+  uint8_t connResult;    // test_connection(): 0 ok, 1 = no reply (0xFFFFFFFF), 2 = all zero
+  uint8_t ifcntDelta;    // IFCNT increments seen during config
+  uint8_t ifcntExpected; // writes issued during config
+};
+static DriverStatus g_drvUD = { false, false, 0xFF, 0, 0 };
+static DriverStatus g_drvLR = { false, false, 0xFF, 0, 0 };
+
+// -------------------- MOTION COMMANDS (loop -> stepper task) --------------------
+// loop() (core 1) writes commands; the stepper task (core 0) owns the
+// AccelStepper objects and publishes positions back. Guarded by g_motionMux.
+enum AxisMode : uint8_t {
+  AXIS_HOLD = 0,   // decelerate (or hard stop) and hold
+  AXIS_JOG_POS,    // move toward the + soft limit (right / up)
+  AXIS_JOG_NEG,    // move toward the - soft limit (left / down)
+  AXIS_GOTO        // move to target (clamped to soft limits)
+};
+struct AxisCommand {
+  AxisMode mode;
+  long     target;   // AXIS_GOTO only
+  bool     enabled;  // driver enabled; the task never steps a disabled axis
+};
+struct AxisFeedback {
+  long position;
+  long target;
+  bool running;
+};
+static portMUX_TYPE  g_motionMux = portMUX_INITIALIZER_UNLOCKED;
+static AxisCommand   g_cmdLR = { AXIS_HOLD, 0, false };
+static AxisCommand   g_cmdUD = { AXIS_HOLD, 0, false };
+static AxisFeedback  g_fbLR  = { 0, 0, false };
+static AxisFeedback  g_fbUD  = { 0, 0, false };
+static TaskHandle_t  g_stepperTask = nullptr;
+
+// Per-axis engine memory (stepper task only). Declared here, ahead of the
+// Arduino builder's auto-generated prototypes, because ServiceAxis() takes it.
+struct AxisEngineState {
+  AxisMode lastMode;
+};
+
+// Console 's' test move: 0 = idle, 1 = going out, 2 = coming back
+static uint8_t g_testJogPhase = 0;
+static long    g_testJogOriginLR = 0;
+static long    g_testJogOriginUD = 0;
+
+// -------------------- LIGHT-BAR PWM --------------------
+static uint8_t g_lightBarDuty = 0;   // last duty written to PIN_PWM_DATA
+
+// -------------------- FRAME SCHEDULER --------------------
+static uint32_t g_lastFrameMs = 0;
 
 // -------------------- BUTTON EDGE STATE (DEBOUNCE) --------------------
 // We will implement a small debounce/edge detector struct in the next block.
@@ -518,7 +624,45 @@ static void ApplyBrightnessFromIndex() {
 
 // -------------------- PWM HELPER (AUX OUTPUT) --------------------
 static void SetAuxPwmDuty(uint8_t duty /*0..255*/) {
+  g_lightBarDuty = duty;
   analogWrite(PIN_PWM_DATA, duty);
+}
+
+// -------------------- STATUS LED (onboard RGB, active-LOW) --------------------
+static void StatusLedInit() {
+  digitalWrite(PIN_STATUS_LED_R, HIGH);
+  digitalWrite(PIN_STATUS_LED_G, HIGH);
+  digitalWrite(PIN_STATUS_LED_B, HIGH);
+  pinMode(PIN_STATUS_LED_R, OUTPUT);
+  pinMode(PIN_STATUS_LED_G, OUTPUT);
+  pinMode(PIN_STATUS_LED_B, OUTPUT);
+}
+
+static void StatusLed(bool r, bool g, bool b) {
+  digitalWrite(PIN_STATUS_LED_R, r ? LOW : HIGH);
+  digitalWrite(PIN_STATUS_LED_G, g ? LOW : HIGH);
+  digitalWrite(PIN_STATUS_LED_B, b ? LOW : HIGH);
+}
+
+// -------------------- DRIVER ENABLE --------------------
+// Only a driver whose UART config was verified may be enabled.
+static bool SetDriverEnabled(DriverStatus &st, uint8_t enPin, bool enable) {
+  if (enable && !st.configOk) return false;
+  digitalWrite(enPin, enable ? LOW : HIGH);   // ~{EN}: LOW = enabled
+  st.enabled = enable;
+  portENTER_CRITICAL(&g_motionMux);
+  if (&st == &g_drvLR) g_cmdLR.enabled = enable;
+  else                 g_cmdUD.enabled = enable;
+  portEXIT_CRITICAL(&g_motionMux);
+  return true;
+}
+
+// -------------------- MOTION FEEDBACK --------------------
+static void ReadMotionFeedback(AxisFeedback &lr, AxisFeedback &ud) {
+  portENTER_CRITICAL(&g_motionMux);
+  lr = g_fbLR;
+  ud = g_fbUD;
+  portEXIT_CRITICAL(&g_motionMux);
 }
 
 // -------------------- BUTTON INSTANCES --------------------
@@ -749,9 +893,13 @@ static void RenderHazardFlash(uint32_t nowMs) {
 }
 
 static void RenderTurnSweep(uint32_t nowMs, bool leftDirection) {
-  if ((nowMs - g_lastTurnMs) < TURN_SIGNAL_INTERVAL_MS) return;
-  g_lastTurnMs = nowMs;
-  g_turnFrame++;
+  // Advance the animation on its own interval, but draw on EVERY frame: the
+  // base mode is redrawn underneath each frame and would otherwise erase the
+  // sweep between animation steps (visible flicker).
+  if ((nowMs - g_lastTurnMs) >= TURN_SIGNAL_INTERVAL_MS) {
+    g_lastTurnMs = nowMs;
+    g_turnFrame++;
+  }
 
   // Keep base nav under sweep (so it still reads like nav lights)
   // If you prefer the sweep to override everything, replace this with ClearAllStrips().
@@ -809,6 +957,110 @@ static void ApplyTurnHazardOverlay(uint32_t nowMs) {
 
 
 // ============================================================================
+// TMC2209 UART CONFIGURATION
+// ============================================================================
+//
+// Both drivers share Serial1 (single-wire bus, addresses from MS1/MS2).
+// A driver is only ever enabled (~{EN} LOW) after its configuration has been
+// written AND verified:
+//   - IFCNT (the chip's successful-write counter) advanced by exactly the
+//     number of writes issued, and
+//   - read-back of the RW registers GCONF / CHOPCONF / PWMCONF matches.
+//
+// TMCStepper keeps a zeroed shadow copy of every register and writes the
+// whole register from it, so a bare microsteps(16) would also write
+// TOFF = 0 (output stage OFF) and a bare pwm_autoscale(true) would zero
+// PWM_OFS/PWM_GRAD. The chip's RW registers are therefore read first and
+// written back so the shadows start from the chip's real values.
+// ============================================================================
+
+static const char *ConnResultText(uint8_t r) {
+  switch (r) {
+    case 0:  return "OK";
+    case 1:  return "NO REPLY (read 0xFFFFFFFF)";
+    case 2:  return "ALL ZERO (read 0x00000000)";
+    default: return "NOT TESTED";
+  }
+}
+
+static bool ConfigureDriver(TMC2209Stepper &d, DriverStatus &st, const char *name) {
+  st.configOk = false;
+  st.ifcntDelta = 0;
+  st.ifcntExpected = 0;
+
+  st.connResult = d.test_connection();
+  if (st.connResult != 0) {
+    Serial.printf("[TMC] %s: test_connection = %u (%s)\n", name, st.connResult, ConnResultText(st.connResult));
+    return false;
+  }
+
+  // Seed TMCStepper's shadow registers with the chip's real values.
+  const uint32_t gconf = d.GCONF();
+  const uint32_t chop  = d.CHOPCONF();
+  const uint32_t pwm   = d.PWMCONF();
+  if (chop == 0 || pwm == 0) {   // reset values are non-zero; 0 means a failed read
+    Serial.printf("[TMC] %s: register read failed (CHOPCONF=0x%08lX PWMCONF=0x%08lX)\n",
+                  name, (unsigned long)chop, (unsigned long)pwm);
+    return false;
+  }
+
+  const uint8_t ifcntBefore = d.IFCNT();
+  uint8_t writes = 0;
+
+  d.GCONF(gconf);                          writes++;
+  d.CHOPCONF(chop);                        writes++;
+  d.PWMCONF(pwm);                          writes++;
+
+  d.pdn_disable(true);                     writes++;  // PDN_UART pin is the UART, not power-down
+  d.mstep_reg_select(true);                writes++;  // microsteps from MRES (MS1/MS2 are the address)
+  d.I_scale_analog(false);                 writes++;  // internal reference: VREF trimpot does NOT scale current
+  d.internal_Rsense(false);                writes++;  // external 0R11 sense resistors
+  d.multistep_filt(true);                  writes++;
+  d.en_spreadCycle(false);                 writes++;  // StealthChop
+
+  d.toff(TMC_TOFF);                        writes++;
+  d.intpol(true);                          writes++;  // interpolate to 256 microsteps
+  d.microsteps(TMC_MICROSTEPS);            writes++;
+
+  d.pwm_autoscale(true);                   writes++;
+  d.pwm_autograd(true);                    writes++;
+
+  d.rms_current(TMC_RUN_CURRENT_MA, TMC_HOLD_MULTIPLIER); writes += 3;  // vsense + IRUN + IHOLD
+  d.iholddelay(TMC_IHOLDDELAY);            writes++;
+  d.TPOWERDOWN(TMC_TPOWERDOWN);            writes++;  // automatic standstill reduction
+
+  d.TCOOLTHRS(TMC_TCOOLTHRS);              writes++;  // StallGuard placeholders (disabled)
+  d.SGTHRS(TMC_SGTHRS);                    writes++;
+
+  const uint8_t ifcntAfter = d.IFCNT();
+  st.ifcntDelta = (uint8_t)(ifcntAfter - ifcntBefore);
+  st.ifcntExpected = writes;
+
+  const bool gconfOk = d.pdn_disable() && d.mstep_reg_select() &&
+                       !d.I_scale_analog() && !d.en_spreadCycle();
+  const bool chopOk  = (d.microsteps() == TMC_MICROSTEPS) && (d.toff() == TMC_TOFF);
+  const bool pwmOk   = d.pwm_autoscale();
+  const bool ifcntOk = (st.ifcntDelta == st.ifcntExpected);
+
+  st.configOk = gconfOk && chopOk && pwmOk && ifcntOk;
+
+  Serial.printf("[TMC] %s: writes %u/%u acked, GCONF %s, CHOPCONF %s, PWMCONF %s -> %s "
+                "(IRUN set %u mA RMS, IHOLD %.0f%%)\n",
+                name, st.ifcntDelta, st.ifcntExpected,
+                gconfOk ? "ok" : "BAD", chopOk ? "ok" : "BAD", pwmOk ? "ok" : "BAD",
+                st.configOk ? "CONFIG OK" : "CONFIG FAILED",
+                d.rms_current(), (double)(TMC_HOLD_MULTIPLIER * 100.0f));
+  return st.configOk;
+}
+
+// ============================================================================
+// END OF TMC2209 UART CONFIGURATION
+// ============================================================================
+
+
+
+
+// ============================================================================
 // STEPPER "JOG" UPDATE (HOLD-TO-MOVE WITH SOFT LIMITS)
 // ============================================================================
 //
@@ -816,22 +1068,32 @@ static void ApplyTurnHazardOverlay(uint32_t nowMs) {
 //  - While PB3 (TURN LEFT) is held: rotate continuously left
 //  - While PB4 (TURN RIGHT) is held: rotate continuously right
 //  - Release: stop smoothly (decelerate) or stop immediately (configurable)
-//  - Prevent motion beyond soft limits (0..MAX)
+//  - Prevent motion beyond soft limits (0..MAX) -- ENFORCED HERE, in the engine
 //  - Uses AccelStepper with acceleration for smooth starts/stops
 //
-// Notes:
-//  - We treat stepperLeftRight position as "steps from full-left".
-//  - g_lrPosSteps is kept in sync with stepperLeftRight.currentPosition().
-//  - Soft limits are enforced using LR_STEP_LIMIT (max travel in steps).
-//    For your 0°..180° idea, LR_STEP_LIMIT should correspond to 180° travel,
-//    but can be tuned to your actual mechanics.
+// Architecture (why there is a task):
+//  - ShowAllStrips() blocks ~24 ms per frame (600 RGBW pixels over RMT), so
+//    AccelStepper polled from loop() would be capped at ~35 steps/s.
+//  - StepperTask() runs on core 0 and is the ONLY code that touches the
+//    AccelStepper objects. loop() (core 1) sends AxisCommands and reads
+//    AxisFeedback through g_motionMux.
+//
+// Soft limits:
+//  - Positions are steps from full-left (pan) / full-down (lift); the turret
+//    must be at full-left / full-down at power-on (no homing yet -- see the
+//    StallGuard placeholders in COMPILE-TIME CONFIGURATION).
+//  - Every target the engine ever uses is clamped to [0, LIMIT]: jog = move
+//    toward the limit, release = decelerate (stop target clamped too).
+//  - LR_STEP_LIMIT must correspond to <= 180 degrees of pan travel.
+//  - The engine never steps an axis whose driver is disabled, so the step
+//    count cannot drift away from the real motor position.
 // ============================================================================
 
 // Jog parameters (tune these):
 static const float LR_JOG_SPEED_STEPS_PER_SEC = 600.0f;  // continuous speed while held
 static const bool  LR_STOP_SMOOTH = true;                // true = decel to stop, false = hard stop
 
-// Optional lift jog parameters (reserved; no buttons assigned yet)
+// Lift jog parameters
 static const float UD_JOG_SPEED_STEPS_PER_SEC = 600.0f;
 static const bool  UD_STOP_SMOOTH = true;
 
@@ -842,7 +1104,7 @@ static inline long ClampLong(long v, long lo, long hi) {
   return v;
 }
 
-// Call once in setup() after configuring max speed/accel
+// Call once in setup() BEFORE the stepper task starts
 static void InitStepperState() {
   // Establish known starting positions (assume we start at "full-left" and "full-down")
   // If you start physically elsewhere, you can set these to match reality.
@@ -852,134 +1114,351 @@ static void InitStepperState() {
   g_lrPosSteps = 0;
   g_udPosSteps = 0;
 
-  // Ensure stopped initially
-  stepperLeftRight.setSpeed(0.0f);
-  stepperUpDown.setSpeed(0.0f);
+  g_fbLR = { 0, 0, false };
+  g_fbUD = { 0, 0, false };
 }
 
-// Decide commanded jog speeds based on held buttons + limits
-static void UpdateJogCommands() {
-  // Sync logical positions from AccelStepper
-  g_lrPosSteps = stepperLeftRight.currentPosition();
-  g_udPosSteps = stepperUpDown.currentPosition();
+// -------------------- ENGINE (stepper task, core 0) --------------------
 
-  // Enforce bounds in case something drifted
-  g_lrPosSteps = ClampLong(g_lrPosSteps, 0, LR_STEP_LIMIT);
-  g_udPosSteps = ClampLong(g_udPosSteps, 0, UD_STEP_LIMIT);
+static void ServiceAxis(AccelStepper &s, AxisEngineState &es, const AxisCommand &c,
+                        long limitHi, bool stopSmooth) {
+  const long lo = 0;
+  const long hi = limitHi;
 
-  // If clamped, force stepper positions to match clamp
-  stepperLeftRight.setCurrentPosition(g_lrPosSteps);
-  stepperUpDown.setCurrentPosition(g_udPosSteps);
+  if (!c.enabled) {
+    // Driver disabled: never issue steps. Hard-stop the profile in place.
+    if (s.distanceToGo() != 0 || s.speed() != 0.0f) {
+      s.setCurrentPosition(s.currentPosition());   // also zeroes speed
+    }
+    es.lastMode = AXIS_HOLD;
+    return;
+  }
+
+  const long pos = s.currentPosition();
+
+  switch (c.mode) {
+    case AXIS_JOG_POS:
+      if (s.targetPosition() != hi) s.moveTo(hi);
+      break;
+
+    case AXIS_JOG_NEG:
+      if (s.targetPosition() != lo) s.moveTo(lo);
+      break;
+
+    case AXIS_GOTO: {
+      const long t = ClampLong(c.target, lo, hi);
+      if (s.targetPosition() != t) s.moveTo(t);
+      break;
+    }
+
+    case AXIS_HOLD:
+    default:
+      if (es.lastMode != AXIS_HOLD) {
+        if (stopSmooth) {
+          s.stop();   // decelerate: sets a target just far enough to stop
+        } else {
+          s.setCurrentPosition(pos);   // hard stop
+        }
+      }
+      break;
+  }
+
+  // Clamp whatever target is now set (stop() may add one step past a limit).
+  const long t = s.targetPosition();
+  const long tc = ClampLong(t, lo, hi);
+  if (t != tc) s.moveTo(tc);
+
+  es.lastMode = c.mode;
+  s.run();
+}
+
+static void StepperTask(void * /*arg*/) {
+  AxisEngineState esLR = { AXIS_HOLD };
+  AxisEngineState esUD = { AXIS_HOLD };
+  uint32_t lastYieldMs = millis();
+
+  for (;;) {
+    AxisCommand lr, ud;
+    portENTER_CRITICAL(&g_motionMux);
+    lr = g_cmdLR;
+    ud = g_cmdUD;
+    portEXIT_CRITICAL(&g_motionMux);
+
+    ServiceAxis(stepperLeftRight, esLR, lr, LR_STEP_LIMIT, LR_STOP_SMOOTH);
+    ServiceAxis(stepperUpDown,    esUD, ud, UD_STEP_LIMIT, UD_STOP_SMOOTH);
+
+    const AxisFeedback fbLR = { stepperLeftRight.currentPosition(),
+                                stepperLeftRight.targetPosition(),
+                                stepperLeftRight.isRunning() };
+    const AxisFeedback fbUD = { stepperUpDown.currentPosition(),
+                                stepperUpDown.targetPosition(),
+                                stepperUpDown.isRunning() };
+    portENTER_CRITICAL(&g_motionMux);
+    g_fbLR = fbLR;
+    g_fbUD = fbUD;
+    portEXIT_CRITICAL(&g_motionMux);
+
+    const uint32_t nowMs = millis();
+    if (!fbLR.running && !fbUD.running) {
+      vTaskDelay(1);                       // idle: poll at 1 kHz
+      lastYieldMs = nowMs;
+    } else if ((nowMs - lastYieldMs) >= STEPPER_TASK_YIELD_MS) {
+      vTaskDelay(1);                       // let IDLE0 feed the task watchdog
+      lastYieldMs = millis();
+    }
+  }
+}
+
+static void StartStepperTask() {
+  stepperLeftRight.setMaxSpeed(min(LR_JOG_SPEED_STEPS_PER_SEC, STEPPER_MAX_SPEED));
+  stepperLeftRight.setAcceleration(STEPPER_ACCEL);
+  stepperUpDown.setMaxSpeed(min(UD_JOG_SPEED_STEPS_PER_SEC, STEPPER_MAX_SPEED));
+  stepperUpDown.setAcceleration(STEPPER_ACCEL);
+
+  xTaskCreatePinnedToCore(StepperTask, "steppers", STEPPER_TASK_STACK, nullptr,
+                          STEPPER_TASK_PRIO, &g_stepperTask, 0 /* core 0 */);
+}
+
+// -------------------- COMMANDS (loop, core 1) --------------------
+static void SetAxisCommands(AxisMode lrMode, long lrTarget, AxisMode udMode, long udTarget) {
+  portENTER_CRITICAL(&g_motionMux);
+  g_cmdLR.mode = lrMode;  g_cmdLR.target = lrTarget;
+  g_cmdUD.mode = udMode;  g_cmdUD.target = udTarget;
+  portEXIT_CRITICAL(&g_motionMux);
+}
+
+// Console 's': out-and-back move of TEST_JOG_STEPS on each axis, inside the
+// soft limits. Any jog button cancels it.
+#if DEBUG_CONSOLE
+static void StartTestJog() {
+  AxisFeedback lr, ud;
+  ReadMotionFeedback(lr, ud);
+  g_testJogOriginLR = lr.position;
+  g_testJogOriginUD = ud.position;
+  g_testJogPhase = 1;
+}
+#endif
+
+static void TestJogTargets(const AxisFeedback &lr, const AxisFeedback &ud, long &tLR, long &tUD) {
+  if (g_testJogPhase == 1) {
+    tLR = (g_testJogOriginLR + TEST_JOG_STEPS <= LR_STEP_LIMIT) ? g_testJogOriginLR + TEST_JOG_STEPS
+                                                                 : g_testJogOriginLR - TEST_JOG_STEPS;
+    tUD = (g_testJogOriginUD + TEST_JOG_STEPS <= UD_STEP_LIMIT) ? g_testJogOriginUD + TEST_JOG_STEPS
+                                                                 : g_testJogOriginUD - TEST_JOG_STEPS;
+    tLR = ClampLong(tLR, 0, LR_STEP_LIMIT);
+    tUD = ClampLong(tUD, 0, UD_STEP_LIMIT);
+    const bool lrDone = !g_drvLR.enabled || (!lr.running && lr.position == tLR);
+    const bool udDone = !g_drvUD.enabled || (!ud.running && ud.position == tUD);
+    if (lrDone && udDone) g_testJogPhase = 2;
+  } else {
+    tLR = g_testJogOriginLR;
+    tUD = g_testJogOriginUD;
+    const bool lrDone = !g_drvLR.enabled || (!lr.running && lr.position == tLR);
+    const bool udDone = !g_drvUD.enabled || (!ud.running && ud.position == tUD);
+    if (lrDone && udDone) {
+      g_testJogPhase = 0;
+      Serial.println("[s] test jog complete");
+    }
+  }
+}
+
+// Call every loop(): decide commands from inputs; the engine enforces limits.
+static void UpdateSteppersJog() {
+  AxisFeedback lr, ud;
+  ReadMotionFeedback(lr, ud);
+  g_lrPosSteps = lr.position;
+  g_udPosSteps = ud.position;
+
+  AxisMode lrMode = AXIS_HOLD;
+  AxisMode udMode = AXIS_HOLD;
+  long lrTarget = 0;
+  long udTarget = 0;
 
   // ---------------- Left/Right Jog ----------------
-  // PB3 held => left (negative direction) but don't go below 0
-  // PB4 held => right (positive direction) but don't exceed LR_STEP_LIMIT
-
-  if (g_turnLeftHeld && !g_turnRightHeld) {
-    if (g_lrPosSteps > 0) {
-      g_lrJogSpeed = -LR_JOG_SPEED_STEPS_PER_SEC;
-    } else {
-      g_lrJogSpeed = 0.0f; // at left limit
-    }
-  } else if (g_turnRightHeld && !g_turnLeftHeld) {
-    if (g_lrPosSteps < LR_STEP_LIMIT) {
-      g_lrJogSpeed = +LR_JOG_SPEED_STEPS_PER_SEC;
-    } else {
-      g_lrJogSpeed = 0.0f; // at right limit
-    }
-  } else {
-    // neither held OR both held (hazard) => stop rotation
-    g_lrJogSpeed = 0.0f;
+  // PB3 held => left (negative direction), PB4 held => right (positive).
+  // Both held (hazard) => no rotation.
+  const bool panJog = (g_turnLeftHeld != g_turnRightHeld);
+  if (panJog) {
+    lrMode = g_turnLeftHeld ? AXIS_JOG_NEG : AXIS_JOG_POS;
   }
 
-  // ---------------- Up/Down Jog (reserved) ----------------
-  // No buttons assigned yet, keep stopped unless you later set g_liftUpHeld/g_liftDownHeld
-  if (g_liftUpHeld && !g_liftDownHeld) {
-    if (g_udPosSteps < UD_STEP_LIMIT) {
-      g_udJogSpeed = +UD_JOG_SPEED_STEPS_PER_SEC;
-    } else {
-      g_udJogSpeed = 0.0f;
-    }
-  } else if (g_liftDownHeld && !g_liftUpHeld) {
-    if (g_udPosSteps > 0) {
-      g_udJogSpeed = -UD_JOG_SPEED_STEPS_PER_SEC;
-    } else {
-      g_udJogSpeed = 0.0f;
-    }
-  } else {
-    g_udJogSpeed = 0.0f;
+  // ---------------- Up/Down Jog ----------------
+  const bool liftJog = (g_liftUpHeld != g_liftDownHeld);
+  if (liftJog) {
+    udMode = g_liftUpHeld ? AXIS_JOG_POS : AXIS_JOG_NEG;
   }
-}
 
-// Apply the jog commands to AccelStepper
-static void ApplyJogToSteppers() {
-  // LEFT/RIGHT
-  if (g_lrJogSpeed != 0.0f) {
-    // Run indefinitely in the commanded direction using runSpeed().
-    // We use setSpeed + runSpeed to get constant speed.
-    stepperLeftRight.setSpeed(g_lrJogSpeed);
-  } else {
-    if (LR_STOP_SMOOTH) {
-      // Smooth stop: command it to stop and let acceleration ramp down.
-      stepperLeftRight.stop();
+  // ---------------- Console test move ----------------
+  if (g_testJogPhase != 0) {
+    if (panJog || liftJog || g_turnLeftHeld || g_turnRightHeld) {
+      g_testJogPhase = 0;                      // buttons always win
+      Serial.println("[s] test jog cancelled by button");
     } else {
-      // Hard stop
-      stepperLeftRight.setSpeed(0.0f);
+      TestJogTargets(lr, ud, lrTarget, udTarget);
+      if (g_testJogPhase != 0) {
+        lrMode = AXIS_GOTO;
+        udMode = AXIS_GOTO;
+      }
     }
   }
 
-  // UP/DOWN
-  if (g_udJogSpeed != 0.0f) {
-    stepperUpDown.setSpeed(g_udJogSpeed);
-  } else {
-    if (UD_STOP_SMOOTH) {
-      stepperUpDown.stop();
-    } else {
-      stepperUpDown.setSpeed(0.0f);
-    }
-  }
-}
+  g_lrJogSpeed = (lrMode == AXIS_JOG_POS) ? LR_JOG_SPEED_STEPS_PER_SEC :
+                 (lrMode == AXIS_JOG_NEG) ? -LR_JOG_SPEED_STEPS_PER_SEC : 0.0f;
+  g_udJogSpeed = (udMode == AXIS_JOG_POS) ? UD_JOG_SPEED_STEPS_PER_SEC :
+                 (udMode == AXIS_JOG_NEG) ? -UD_JOG_SPEED_STEPS_PER_SEC : 0.0f;
 
-// Call every loop()
-static void UpdateSteppersJog() {
-  // Determine desired speeds based on inputs + limits
-  UpdateJogCommands();
-
-  // Apply desired speeds/stops
-  ApplyJogToSteppers();
-
-  // Execute motion (non-blocking)
-  // If we're using constant speed jogging, use runSpeed().
-  // For smooth stop, AccelStepper uses its internal target; run() is safer.
-  // We'll call BOTH: run() handles decel targets, runSpeed handles steady jog.
-  //
-  // Pattern:
-  //  - When moving: runSpeed() advances at setSpeed
-  //  - When stopping smoothly: stop() sets a target; run() decelerates to it
-  //
-  // This combination works reliably for jog + smooth stop.
-
-  // Left/Right axis
-  if (g_lrJogSpeed != 0.0f) {
-    stepperLeftRight.runSpeed();
-  } else {
-    stepperLeftRight.run(); // allow smooth stop decel if enabled
-  }
-
-  // Up/Down axis
-  if (g_udJogSpeed != 0.0f) {
-    stepperUpDown.runSpeed();
-  } else {
-    stepperUpDown.run();
-  }
-
-  // Re-sync logical positions (so overlays/limits reflect actual motion)
-  g_lrPosSteps = stepperLeftRight.currentPosition();
-  g_udPosSteps = stepperUpDown.currentPosition();
+  SetAxisCommands(lrMode, lrTarget, udMode, udTarget);
 }
 
 // ============================================================================
 // END OF STEPPER JOG UPDATE
+// ============================================================================
+
+
+
+
+
+// ============================================================================
+// SERIAL DEBUG CONSOLE (USB CDC, non-blocking)
+// ============================================================================
+#if DEBUG_CONSOLE
+
+static char    g_conLine[32];
+static uint8_t g_conLen = 0;
+
+static void ConsoleHelp() {
+  Serial.println(F("--- kayak turret console ---"));
+  Serial.println(F("?          this menu"));
+  Serial.println(F("e          toggle driver EN (only drivers whose UART config verified)"));
+  Serial.println(F("d          dump test_connection + DRV_STATUS for both drivers"));
+  Serial.println(F("s          short out-and-back jog on each axis (within soft limits)"));
+  Serial.println(F("i          print IMU"));
+  Serial.println(F("b          print LED power-budget numbers"));
+  Serial.println(F("p <0-255>  set light-bar PWM duty"));
+}
+
+static void DumpDriver(TMC2209Stepper &d, const DriverStatus &st, const char *name,
+                       uint8_t enPin, uint8_t diagPin, const AxisFeedback &fb, long limit) {
+  const uint8_t conn = d.test_connection();
+  Serial.printf("== %s (addr %u) ==\n", name, (&d == &driverUpDown) ? TMC_ADDR_UPDOWN : TMC_ADDR_LEFTRIGHT);
+  Serial.printf("  test_connection : %u (%s)\n", conn, ConnResultText(conn));
+  Serial.printf("  config          : %s (IFCNT %u/%u at boot)\n",
+                st.configOk ? "VERIFIED" : "NOT VERIFIED", st.ifcntDelta, st.ifcntExpected);
+  Serial.printf("  ~EN pin         : %s (%s)\n", digitalRead(enPin) ? "HIGH" : "LOW",
+                st.enabled ? "enabled" : "disabled");
+  Serial.printf("  DIAG pin        : %s\n", digitalRead(diagPin) ? "HIGH" : "LOW");
+  Serial.printf("  position        : %ld / %ld steps (target %ld, %s)\n",
+                fb.position, limit, fb.target, fb.running ? "moving" : "stopped");
+  if (conn != 0) return;
+
+  const uint32_t ds = d.DRV_STATUS();
+  Serial.printf("  DRV_STATUS      : 0x%08lX\n", (unsigned long)ds);
+  Serial.printf("    stst=%u stealth=%u cs_actual=%u otpw=%u ot=%u s2ga=%u s2gb=%u ola=%u olb=%u\n",
+                d.stst(), d.stealth(), d.cs_actual(), d.otpw(), d.ot(),
+                d.s2ga(), d.s2gb(), d.ola(), d.olb());
+  Serial.printf("  GCONF 0x%08lX  CHOPCONF 0x%08lX  PWMCONF 0x%08lX\n",
+                (unsigned long)d.GCONF(), (unsigned long)d.CHOPCONF(), (unsigned long)d.PWMCONF());
+  Serial.printf("  microsteps=%u  rms_current(set)=%u mA  TSTEP=%lu  SG_RESULT=%u  IFCNT=%u\n",
+                d.microsteps(), d.rms_current(), (unsigned long)d.TSTEP(), d.SG_RESULT(), d.IFCNT());
+}
+
+static void ConsoleExecute(const char *line) {
+  while (*line == ' ') line++;
+  const char cmd = *line;
+  const char *arg = line + 1;
+  while (*arg == ' ') arg++;
+
+  switch (cmd) {
+    case '?':
+      ConsoleHelp();
+      break;
+
+    case 'e': {
+      const bool want = !(g_drvUD.enabled || g_drvLR.enabled);
+      const bool okUD = SetDriverEnabled(g_drvUD, PIN_UPDOWN_EN, want);
+      const bool okLR = SetDriverEnabled(g_drvLR, PIN_LEFTRIGHT_EN, want);
+      Serial.printf("[e] UP/DOWN %s%s, LEFT/RIGHT %s%s\n",
+                    g_drvUD.enabled ? "ENABLED" : "disabled", okUD ? "" : " (refused: config not verified)",
+                    g_drvLR.enabled ? "ENABLED" : "disabled", okLR ? "" : " (refused: config not verified)");
+      break;
+    }
+
+    case 'd': {
+      AxisFeedback lr, ud;
+      ReadMotionFeedback(lr, ud);
+      DumpDriver(driverUpDown,    g_drvUD, "UP/DOWN (A2)",    PIN_UPDOWN_EN,    PIN_UPDOWN_DIAG,    ud, UD_STEP_LIMIT);
+      DumpDriver(driverLeftRight, g_drvLR, "LEFT/RIGHT (A3)", PIN_LEFTRIGHT_EN, PIN_LEFTRIGHT_DIAG, lr, LR_STEP_LIMIT);
+      break;
+    }
+
+    case 's':
+      if (!g_drvUD.enabled && !g_drvLR.enabled) {
+        Serial.println("[s] no driver enabled -- nothing would move ('e' to enable)");
+        break;
+      }
+      StartTestJog();
+      Serial.printf("[s] test jog +/-%ld steps on each enabled axis\n", TEST_JOG_STEPS);
+      break;
+
+    case 'i': {
+      sensors_event_t a, g, t;
+      if (imu.getEvent(&a, &g, &t)) {
+        Serial.printf("[i] accel %.2f %.2f %.2f m/s2  gyro %.3f %.3f %.3f rad/s  temp %.1f C\n",
+                      a.acceleration.x, a.acceleration.y, a.acceleration.z,
+                      g.gyro.x, g.gyro.y, g.gyro.z, t.temperature);
+      } else {
+        Serial.println("[i] IMU read failed");
+      }
+      break;
+    }
+
+    case 'b':
+      Serial.printf("[b] lit %u/%u px (%.3f) x applied %u/255 = %.4f (limit %.2f)  requested %u%s\n",
+                    g_budget.litPixels, g_budget.totalPixels, (double)g_budget.litFraction,
+                    g_budget.applied, (double)g_budget.product, (double)LED_POWER_BUDGET_MAX,
+                    g_budget.requested, g_budget.limited ? "  ** LIMITED **" : "");
+      break;
+
+    case 'p': {
+      char *end = nullptr;
+      const long v = strtol(arg, &end, 10);
+      if (end == arg || v < 0 || v > 255) {
+        Serial.println("[p] usage: p <0-255>");
+        break;
+      }
+      SetAuxPwmDuty((uint8_t)v);
+      Serial.printf("[p] light-bar duty %ld/255\n", v);
+      break;
+    }
+
+    case '\0':
+      break;
+
+    default:
+      Serial.printf("unknown command '%c' -- '?' for help\n", cmd);
+      break;
+  }
+}
+
+// Non-blocking: consumes whatever bytes are available, executes on CR/LF.
+static void PollConsole() {
+  while (Serial.available() > 0) {
+    const int c = Serial.read();
+    if (c < 0) break;
+    if (c == '\r' || c == '\n') {
+      g_conLine[g_conLen] = '\0';
+      if (g_conLen > 0) ConsoleExecute(g_conLine);
+      g_conLen = 0;
+    } else if (g_conLen < sizeof(g_conLine) - 1) {
+      g_conLine[g_conLen++] = (char)c;
+    }
+  }
+}
+
+#endif  // DEBUG_CONSOLE
+
+// ============================================================================
+// END OF SERIAL DEBUG CONSOLE
 // ============================================================================
 
 
@@ -1027,6 +1506,9 @@ void setup() {
   pinMode(PIN_PWM_DATA, OUTPUT);
   SetAuxPwmDuty(0);
 
+  // Status LED off
+  StatusLedInit();
+
   // -------------------- CORE --------------------
   Serial.begin(115200);
   delay(STARTUP_DELAY_MS);   // allow power rails + level shifter to settle
@@ -1037,21 +1519,43 @@ void setup() {
   pinMode(PIN_PB_TURN_LEFT,  INPUT_PULLUP);
   pinMode(PIN_PB_TURN_RIGHT, INPUT_PULLUP);
 
-  // -------------------- STEPPER DRIVER ENABLES --------------------
-  // ~{EN} is active-LOW and was driven HIGH (disabled) at the top of setup().
-  // SAFE POWER-ON: drivers stay disabled until UART configuration has
-  // succeeded. Without UART config the current is set by the module's VREF
-  // trimpot, not by firmware.
-
-  // Configure stepper motion limits
-  stepperUpDown.setMaxSpeed(STEPPER_MAX_SPEED);
-  stepperUpDown.setAcceleration(STEPPER_ACCEL);
-
-  stepperLeftRight.setMaxSpeed(STEPPER_MAX_SPEED);
-  stepperLeftRight.setAcceleration(STEPPER_ACCEL);
+  // -------------------- TMC2209 DIAG INPUTS --------------------
+  // Driven by the TMC2209 at VIO (3.3 V). Pull-down keeps a missing module LOW.
+  pinMode(PIN_UPDOWN_DIAG,    INPUT_PULLDOWN);
+  pinMode(PIN_LEFTRIGHT_DIAG, INPUT_PULLDOWN);
 
   // Establish known starting positions (logical 0)
   InitStepperState();
+
+  // -------------------- TMC2209 UART BRING-UP --------------------
+  // Status LED: BLUE while probing, GREEN = both drivers verified,
+  // RED = one or both failed (a failed driver stays disabled).
+  StatusLed(false, false, true);
+  Serial1.begin(TMC_UART_BAUD, SERIAL_8N1, PIN_TMC_UART_RX, PIN_TMC_UART_TX);
+  driverUpDown.begin();      // no pin/baud side effects on ESP32 (SW_CAPABLE_PLATFORM false)
+  driverLeftRight.begin();
+
+  const bool okUD = ConfigureDriver(driverUpDown,    g_drvUD, "UP/DOWN (A2, addr 0)");
+  const bool okLR = ConfigureDriver(driverLeftRight, g_drvLR, "LEFT/RIGHT (A3, addr 1)");
+
+  // -------------------- STEPPER DRIVER ENABLES --------------------
+  // ~{EN} is active-LOW and was driven HIGH (disabled) at the top of setup().
+  // SAFE POWER-ON: a driver is enabled ONLY after its UART config verified.
+  // A driver that failed stays disabled: its current would otherwise be set
+  // by the module's VREF trimpot, not by firmware.
+  SetDriverEnabled(g_drvUD, PIN_UPDOWN_EN,    okUD);
+  SetDriverEnabled(g_drvLR, PIN_LEFTRIGHT_EN, okLR);
+  if (okUD && okLR) {
+    StatusLed(false, true, false);
+    Serial.println("[TMC] both drivers verified and ENABLED");
+  } else {
+    StatusLed(true, false, false);
+    Serial.printf("[TMC] driver config FAILED (UP/DOWN %s, LEFT/RIGHT %s) -- failed driver(s) left DISABLED\n",
+                  okUD ? "ok" : "FAIL", okLR ? "ok" : "FAIL");
+  }
+
+  // Motion engine on core 0 (owns the AccelStepper objects from here on)
+  StartStepperTask();
 
   // -------------------- IMU (MPU6050) --------------------
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
@@ -1078,6 +1582,9 @@ void setup() {
   ShowAllStrips();
 
   Serial.println("Setup complete");
+#if DEBUG_CONSOLE
+  Serial.println("Type ? for the debug console menu");
+#endif
 }
 
 // ============================================================================
@@ -1093,14 +1600,21 @@ void setup() {
 // ============================================================================
 //
 // Scheduler order (every cycle):
+//  0) Poll the debug console (if compiled in)
 //  1) Read inputs (debounced + edges + held states)
 //  2) Update "one-shot" state changes (brightness/mode changes)
-//  3) Render LEDs: base mode then apply turn/hazard overlay
-//  4) Update stepper jogging (hold-to-move with limits)
+//  3) Update stepper jog commands (engine runs in its own task on core 0)
+//  4) Every FRAME_INTERVAL_MS: render base mode + overlay, enforce the power
+//     budget, show
 // ============================================================================
 
 void loop() {
   const uint32_t nowMs = millis();
+
+  // -------------------- 0) DEBUG CONSOLE --------------------
+#if DEBUG_CONSOLE
+  PollConsole();
+#endif
 
   // -------------------- 1) INPUTS --------------------
   UpdateInputs(nowMs);
@@ -1131,27 +1645,32 @@ void loop() {
     g_turnFrame  = 0;
   }
 
-  // -------------------- 3) LED RENDERING --------------------
-  // Base mode first
-  RenderBaseMode(nowMs);
-
-  // Overlay turn/hazard effects when turn buttons are held
-  // (This can override base visuals during hazard/turn indication)
-  if (g_turnLeftHeld || g_turnRightHeld) {
-    ApplyTurnHazardOverlay(nowMs);
-  }
-
-  // Power budget from the actual pixel buffers, then push pixels out.
-  // HARD SAFETY CONSTRAINT: nothing may sit between these two calls.
-  EnforcePowerBudget();
-  ShowAllStrips();
-
-  // -------------------- 4) STEPPER UPDATE --------------------
-  // Jog rotation while buttons are held + enforce soft limits
+  // -------------------- 3) STEPPER UPDATE --------------------
+  // Jog commands from held buttons; the engine on core 0 executes them and
+  // enforces the soft limits. Done before rendering so button-to-motion
+  // latency does not include a ~24 ms show().
   UpdateSteppersJog();
 
-  // Short cooperative delay to reduce CPU churn
-  delay(5);
+  // -------------------- 4) LED RENDERING (frame scheduler) --------------------
+  // Replaces the old delay(5): render + show at FRAME_INTERVAL_MS. Steppers
+  // no longer depend on loop() rate.
+  if ((nowMs - g_lastFrameMs) >= FRAME_INTERVAL_MS) {
+    g_lastFrameMs = nowMs;
+
+    // Base mode first
+    RenderBaseMode(nowMs);
+
+    // Overlay turn/hazard effects when turn buttons are held
+    // (This can override base visuals during hazard/turn indication)
+    if (g_turnLeftHeld || g_turnRightHeld) {
+      ApplyTurnHazardOverlay(nowMs);
+    }
+
+    // Power budget from the actual pixel buffers, then push pixels out.
+    // HARD SAFETY CONSTRAINT: nothing may sit between these two calls.
+    EnforcePowerBudget();
+    ShowAllStrips();
+  }
 }
 
 // ============================================================================
