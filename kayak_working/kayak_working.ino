@@ -475,7 +475,7 @@ static bool g_liftDownHeld = false;
 struct DriverStatus {
   bool    configOk;      // UART config written AND verified
   bool    enabled;       // ~{EN} currently driven LOW
-  uint8_t connResult;    // test_connection(): 0 ok, 1 = no reply (0xFFFFFFFF), 2 = all zero
+  uint8_t connResult;    // test_connection(): 0 ok, 1 = read 0xFFFFFFFF, 2 = no reply (read timed out -> 0)
   uint8_t ifcntDelta;    // IFCNT increments seen during config
   uint8_t ifcntExpected; // writes issued during config
 };
@@ -1253,8 +1253,8 @@ static void StartImuTask() {
 static const char *ConnResultText(uint8_t r) {
   switch (r) {
     case 0:  return "OK";
-    case 1:  return "NO REPLY (read 0xFFFFFFFF)";
-    case 2:  return "ALL ZERO (read 0x00000000)";
+    case 1:  return "read 0xFFFFFFFF (line stuck HIGH?)";
+    case 2:  return "NO REPLY (timeout/CRC error -> read 0)";
     default: return "NOT TESTED";
   }
 }
