@@ -35,17 +35,31 @@
   Author: [SPENCER MCMASTER]
   Date:   [DEC 14, 2025]
 
-  NOTE (Nov 2026): PIN DEFINITIONS BELOW ARE KNOWN STALE vs. the KiCad
-  netlist "kayak working.net" (rev 2.0). Claude Code Phase 0 must rewrite
-  them from the netlist. Known deltas:
-    - EN and DIR are swapped on both drivers
-    - Buttons are on A0-A3, not A2-A5
-    - I2C is on A4/SDA, A5/SCL, not A6/A7
-    - DIAG pins land on A6 (up/down) and A7 (left/right)
-    - TMC2209 UART is on D0/RX, D1/TX
-    - LED counts are 256/256/44/44, not 250/250/50/50
+  PIN SOURCE OF TRUTH (Nov 2026):
+    PIN DEFINITIONS match the KiCad netlist "kayak working.net" (rev 2.0,
+    Eeschema 9.0.6) pin-for-pin. Firmware follows KiCad, never the reverse.
+    Re-check after any schematic change with:
+        python3 tools/netlist_audit.py "kayak working.net"
+
+  BUILD:
+    FQBN arduino:esp32:nano_nora:PinNumbers=byGPIONumber, core 2.0.17.
+    (Arduino IDE: Tools > Pin Numbering > "By GPIO number (legacy)".)
+    The D0..D13 / A0..A7 names below still work; in this mode they resolve
+    to raw GPIO numbers, which is what every library here expects.
 ===============================================================================
 */
+
+// ----------------------------------------------------------------------------
+// PIN NUMBERING GUARD
+// With the default "By Arduino pin" numbering, Adafruit_NeoPixel on core
+// 2.0.17 (ESP-IDF 4.4 RMT path, esp.c) passes the pin number straight to the
+// IDF RMT driver WITHOUT remapping, while its pinMode()/digitalWrite() ARE
+// remapped. Result: e.g. a strip on D9 drives GPIO18 low and emits data on
+// GPIO9 (= D6, a STEP line). Build "By GPIO number" so every API agrees.
+// ----------------------------------------------------------------------------
+#if defined(BOARD_HAS_PIN_REMAP) && !defined(BOARD_USES_HW_GPIO_NUMBERS)
+#error "Build with Tools > Pin Numbering > By GPIO number (FQBN option PinNumbers=byGPIONumber). See PIN NUMBERING GUARD."
+#endif
 
 #include <Arduino.h>                          // Core Arduino definitions
 #include <Wire.h>                             // I2C communication (MPU6050)
@@ -64,10 +78,10 @@
 // Set the exact number of LEDs on each physical run.
 // These MUST match the real strip lengths.
 
-static const uint16_t LED_COUNT_BOTTOM_LEFT   = 250;
-static const uint16_t LED_COUNT_BOTTOM_RIGHT  = 250;
-static const uint16_t LED_COUNT_COCKPIT_FRONT = 50;
-static const uint16_t LED_COUNT_COCKPIT_BACK  = 50;
+static const uint16_t LED_COUNT_BOTTOM_LEFT   = 256;
+static const uint16_t LED_COUNT_BOTTOM_RIGHT  = 256;
+static const uint16_t LED_COUNT_COCKPIT_FRONT = 44;
+static const uint16_t LED_COUNT_COCKPIT_BACK  = 44;
 
 // SK6812 RGBW strips (12V) timing + color order
 // Most SK6812 RGBW strips are GRBW.
@@ -125,60 +139,71 @@ static const uint16_t STARTUP_DELAY_MS = 150;
 
 
 // ============================================================================
-// PIN DEFINITIONS (STALE — SEE HEADER NOTE; REWRITE FROM NETLIST)
+// PIN DEFINITIONS (FROM KiCad NETLIST "kayak working.net" rev 2.0)
 // ============================================================================
+// Every line cites its netlist net name. Refdes: A1 = Nano ESP32 socket,
+// A2 = TMC2209 UP/DOWN (motor on J3), A3 = TMC2209 LEFT/RIGHT (motor on J4),
+// U1 = 74HCT245 (DIR "A->B" tied +5V, CE tied GND), U2 = GY-521.
+// GPIO numbers in comments: arduino:esp32 2.0.17 variants/arduino_nano_nora.
 
 // -------------------- LED DATA OUTPUTS --------------------
-// Via SN74HCT245 level shifter + 330Ω series resistors
+// MCU -> U1 A-side (3.3 V in, HCT VIH = 2.0 V) -> B-side (5 V) -> 330R -> J2
+static const uint8_t PIN_LED_BOTTOM_LEFT   = D12; // GPIO47  net Net-(A1-D12_MISO) -> U1.A0 -> B0 -> R1 -> J2.1 "TO BOTTOM LEFT LED DATA PIN"
+static const uint8_t PIN_LED_BOTTOM_RIGHT  = D11; // GPIO38  net Net-(A1-D11_MOSI) -> U1.A1 -> B1 -> R2 -> J2.2 "TO BOTTOM RIGHT LED DATA PIN"
+static const uint8_t PIN_LED_COCKPIT_FRONT = D10; // GPIO21  net Net-(U1-A2)       -> U1.A2 -> B2 -> R3 -> J2.3 "TO COCKPIT FRONT LED DATA PIN"
+static const uint8_t PIN_LED_COCKPIT_BACK  = D9;  // GPIO18  net Net-(U1-A3)       -> U1.A3 -> B3 -> R4 -> J2.4 "TO COCKPIT BACK LED DATA PIN"
 
-// ARDUINO D12 -> SN74HCT245 A1/B1 -> Bottom Left LED strip
-static const uint8_t PIN_LED_BOTTOM_LEFT   = D12;
+// -------------------- LIGHT-BAR PWM OUTPUT --------------------
+// NOT level-shifted: 3.3 V PWM straight to the MOSFET module input.
+static const uint8_t PIN_PWM_DATA          = D8;  // GPIO17  net Net-(J2-Pin_5)    -> J2.5 "PWM CONTROL"
 
-// ARDUINO D11 -> SN74HCT245 A2/B2 -> Bottom Right LED strip
-static const uint8_t PIN_LED_BOTTOM_RIGHT  = D11;
+// -------------------- STEPPER DRIVER PINS (TMC2209 STEP/DIR/EN) --------------------
+// EN is active-LOW (~{EN}); module has a 20k pull-up to VIO, so EN floats
+// HIGH (driver disabled) while the ESP32 is in reset / booting.
 
-// ARDUINO D10 -> SN74HCT245 A3/B3 -> Cockpit Front LED strip
-static const uint8_t PIN_LED_COCKPIT_FRONT = D10;
+// Up / Down lift axis -- TMC2209 A2, motor terminal J3 "UP/DOWN"
+static const uint8_t PIN_UPDOWN_EN         = D5;  // GPIO8   net Net-(A2-~{EN})    -> A2.8  ~{EN}
+static const uint8_t PIN_UPDOWN_STEP       = D6;  // GPIO9   net Net-(A2-STEP)     -> A2.2  STEP
+static const uint8_t PIN_UPDOWN_DIR        = D7;  // GPIO10  net Net-(A2-DIR)      -> A2.1  DIR
+static const uint8_t PIN_UPDOWN_DIAG       = A6;  // GPIO13  net Net-(A1-PadA6)    <- A2    DIAG_A2 (StallGuard/error out, VIO = 3.3 V)
 
-// ARDUINO D9  -> SN74HCT245 A4/B4 -> Cockpit Back LED strip
-static const uint8_t PIN_LED_COCKPIT_BACK  = D9;
+// Left / Right pan axis -- TMC2209 A3, motor terminal J4 "LEFT/RIGHT"
+static const uint8_t PIN_LEFTRIGHT_EN      = D2;  // GPIO5   net Net-(A3-~{EN})    -> A3.8  ~{EN}
+static const uint8_t PIN_LEFTRIGHT_STEP    = D3;  // GPIO6   net Net-(A3-STEP)     -> A3.2  STEP
+static const uint8_t PIN_LEFTRIGHT_DIR     = D4;  // GPIO7   net Net-(A3-DIR)      -> A3.1  DIR
+static const uint8_t PIN_LEFTRIGHT_DIAG    = A7;  // GPIO14  net Net-(A1-PadA7)    <- A3    DIAG_A3 (StallGuard/error out, VIO = 3.3 V)
 
-// -------------------- PWM OUTPUT --------------------
-// ARDUINO D8 -> Auxiliary PWM data pin
-static const uint8_t PIN_PWM_DATA          = D8;
+// -------------------- TMC2209 UART (shared bus, both drivers) --------------------
+// Used by Serial1 (Serial = native USB CDC, so no clash with debug output).
+// BTT TMC2209 V1.3 (module schematic + manual): header pin 5 "RX"/UART_RX
+// is wired DIRECTLY to PDN_UART; header pin 4 "TX"/UART_TX reaches PDN_UART
+// only through R10, which is NOT FITTED at the factory. There is no series
+// resistor on the module. See BRINGUP open item "TMC UART wiring" before
+// Phase 2 relies on PIN_TMC_UART_TX.
+static const uint8_t PIN_TMC_UART_RX       = D0;  // GPIO44  net Net-(A1-D0{slash}RX) -> A2.5, A3.5 UART_RX (= PDN_UART)
+static const uint8_t PIN_TMC_UART_TX       = D1;  // GPIO43  net Net-(A1-D1{slash}TX) -> A2.4, A3.4 UART_TX (-> R10, NC by default)
 
-// -------------------- STEPPER DRIVER PINS (TMC2209 STEP/DIR) --------------------
+// UART slave addresses from MS1/MS2 tie-offs (MS1 = bit 0, MS2 = bit 1)
+static const uint8_t TMC_ADDR_UPDOWN       = 0;   // A2: MS1 = GND, MS2 = GND
+static const uint8_t TMC_ADDR_LEFTRIGHT    = 1;   // A3: MS1 = +3V3, MS2 = GND
 
-// Up / Down axis
-static const uint8_t PIN_UPDOWN_EN          = D7;
-static const uint8_t PIN_UPDOWN_STEP        = D6;
-static const uint8_t PIN_UPDOWN_DIR         = D5;
-
-// Left / Right rotation axis
-static const uint8_t PIN_LEFTRIGHT_EN       = D4;
-static const uint8_t PIN_LEFTRIGHT_STEP     = D3;
-static const uint8_t PIN_LEFTRIGHT_DIR      = D2;
-
-// -------------------- BUTTON INPUTS --------------------
-// Active-low momentary buttons (use INPUT_PULLUP)
-
-// PB1: Brightness
-static const uint8_t PIN_PB_BRIGHTNESS      = A2;
-
-// PB2: Mode select
-static const uint8_t PIN_PB_MODE            = A3;
-
-// PB3: Light bar turn LEFT
-static const uint8_t PIN_PB_TURN_LEFT       = A4;
-
-// PB4: Light bar turn RIGHT
-static const uint8_t PIN_PB_TURN_RIGHT      = A5;
+// -------------------- BUTTON INPUTS (J6) --------------------
+// Active-low momentary to J6.5 COMMON GND, INPUT_PULLUP, no external resistors.
+// NOTE: J6 terminal order is reversed relative to A0..A3.
+static const uint8_t PIN_PB_BRIGHTNESS     = A3;  // GPIO4   net Net-(J6-Pin_1)    -> J6.1 "PB1 BRIGHTNESS"
+static const uint8_t PIN_PB_MODE           = A2;  // GPIO3   net Net-(J6-Pin_2)    -> J6.2 "PB1 MODE"
+static const uint8_t PIN_PB_TURN_LEFT      = A1;  // GPIO2   net Net-(J6-Pin_3)    -> J6.3 "PB1 LEFT"
+static const uint8_t PIN_PB_TURN_RIGHT     = A0;  // GPIO1   net Net-(J6-Pin_4)    -> J6.4 "PB1 RIGHT"
 
 // -------------------- IMU (GY-521 MPU6050) --------------------
-// I2C pins
+// U2 VCC = +5V (module LDO), AD0 unconnected (module pull-down -> 0x68), INT unconnected.
+static const uint8_t PIN_I2C_SDA           = A4;  // GPIO11  net Net-(A1-A4{slash}SDA) -> U2.4 SDA
+static const uint8_t PIN_I2C_SCL           = A5;  // GPIO12  net Net-(A1-A5{slash}SCL) -> U2.3 SCL
+static const uint8_t IMU_I2C_ADDR          = 0x68;
 
-static const uint8_t PIN_I2C_SDA             = A6;
-static const uint8_t PIN_I2C_SCL             = A7;
+// -------------------- UNUSED / RESERVED MCU PINS --------------------
+// D13 (GPIO48, SCK/LED_BUILTIN): unconnected-(A1-D13_SCK-PadD13) -- off-limits.
+// B0, B1, RST, 5V: unconnected. VIN = +12V (J5), 3V3 -> TMC VIO + A3 MS1.
 
 // ============================================================================
 // END OF PIN DEFINITIONS
@@ -882,12 +907,14 @@ void setup() {
   SetAuxPwmDuty(0);          // ensure auxiliary output is off
 
   // -------------------- STEPPER DRIVER ENABLES --------------------
-  // NOTE: Most TMC2209 boards use LOW = enabled
+  // ~{EN} is active-LOW. SAFE POWER-ON: drivers stay DISABLED (HIGH) until
+  // UART configuration has succeeded (Phase 2). Without UART config the
+  // current is set by the module's VREF trimpot, not by firmware.
+  // Write the level BEFORE switching to OUTPUT so there is no LOW glitch.
+  digitalWrite(PIN_UPDOWN_EN, HIGH);
+  digitalWrite(PIN_LEFTRIGHT_EN, HIGH);
   pinMode(PIN_UPDOWN_EN, OUTPUT);
   pinMode(PIN_LEFTRIGHT_EN, OUTPUT);
-
-  digitalWrite(PIN_UPDOWN_EN, LOW);      // enable up/down driver
-  digitalWrite(PIN_LEFTRIGHT_EN, LOW);   // enable left/right driver
 
   // Configure stepper motion limits
   stepperUpDown.setMaxSpeed(STEPPER_MAX_SPEED);
@@ -914,7 +941,7 @@ void setup() {
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
 
   // Optional sanity check
-  if (!imu.begin()) {
+  if (!imu.begin(IMU_I2C_ADDR, &Wire)) {
     Serial.println("MPU6050 NOT DETECTED");
   } else {
     Serial.println("MPU6050 OK");

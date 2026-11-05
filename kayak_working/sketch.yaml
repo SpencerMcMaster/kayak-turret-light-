@@ -1,0 +1,4 @@
+# arduino-cli picks this up automatically: `arduino-cli compile kayak_working`
+# PinNumbers=byGPIONumber is REQUIRED -- see the PIN NUMBERING note in
+# kayak_working.ino. The sketch refuses to compile without it.
+default_fqbn: arduino:esp32:nano_nora:PinNumbers=byGPIONumber

@@ -259,18 +259,18 @@ def audit(comps, nets, mcu_ref=None):
                  "verify with the module schematic before assuming.")
         uart = pnet(r"PDN|UART|PDN_UART|^RX$|^TX$")
         info(f"{ref}: PDN_UART net = `{uart}`")
-        en = pnet(r"^(EN|ENN|EN_N)$")
+        en = pnet(r"^(~\{EN\}|~\{ENN\}|~EN|/EN|EN|ENN|EN_N)$")
         info(f"{ref}: EN net = `{en}`")
 
     # ---- 4. 74HCT245 checks --------------------------------------------------
     for ref in sorted(r for r, k in cls.items() if k == "HCT245"):
         for n, nm in by_ref[ref]:
             f = (n.func or "").upper()
-            if f in ("DIR", "A/B", "AB"):
+            if f in ("DIR", "A/B", "AB", "A->B", "A-B", "T/R"):
                 lvl = net_level(nm)
                 (info if lvl == "HIGH" else danger)(
                     f"{ref}: DIR on `{nm}` ({lvl}) -- must be HIGH for A->B.")
-            if re.match(r"^~?\{?OE\}?$|^~OE|^OE#|^/OE|^G$|^~\{OE\}$", f):
+            if re.match(r"^~?\{?(OE|CE|G)\}?$|^(OE|CE)#$|^/(OE|CE)$", f):
                 lvl = net_level(nm)
                 (info if lvl == "LOW" else danger)(
                     f"{ref}: OE on `{nm}` ({lvl}) -- must be LOW (outputs enabled).")
