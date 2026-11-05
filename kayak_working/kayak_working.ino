@@ -89,10 +89,21 @@ static const uint16_t LED_COUNT_COCKPIT_BACK  = 44;
 static const neoPixelType LED_PIXEL_TYPE =
   (neoPixelType)(NEO_GRBW + NEO_KHZ800);
 
+// Bytes per pixel, decoded from the NeoPixel type (W offset == R offset -> RGB)
+static const uint8_t LED_BYTES_PER_PIXEL =
+  (((LED_PIXEL_TYPE >> 6) & 0x03) == ((LED_PIXEL_TYPE >> 4) & 0x03)) ? 3 : 4;
+
 // Global brightness limits (important for 12V current control)
 static const uint8_t BRIGHTNESS_MIN     = 16;   // very dim but visible
 static const uint8_t BRIGHTNESS_MAX     = 220;  // DO NOT run full 255 on 12V bench
 static const uint8_t BRIGHTNESS_DEFAULT = 96;
+
+// -------------------- LED POWER BUDGET (HARD SAFETY CONSTRAINT) --------------------
+// (fraction of LEDs lit) x (applied brightness / 255) must stay <= 0.20,
+// computed from the real pixel buffers every frame by EnforcePowerBudget().
+// Over budget -> brightness is scaled down (pixels are never switched off).
+// DO NOT raise, remove or bypass.
+static const float LED_POWER_BUDGET_MAX = 0.20f;
 
 // Number of discrete brightness steps for PB1
 static const uint8_t BRIGHTNESS_LEVELS = 4;
@@ -254,6 +265,17 @@ Adafruit_NeoPixel* LED_STRIPS[] = {
 static const uint8_t LED_STRIP_COUNT =
   sizeof(LED_STRIPS) / sizeof(LED_STRIPS[0]);
 
+static const uint16_t LED_TOTAL_PIXELS =
+  LED_COUNT_BOTTOM_LEFT + LED_COUNT_BOTTOM_RIGHT +
+  LED_COUNT_COCKPIT_FRONT + LED_COUNT_COCKPIT_BACK;
+
+// Largest single strip, in bytes (scratch buffer for lossless brightness scaling)
+static const uint16_t LED_MAX_STRIP_PIXELS =
+  (LED_COUNT_BOTTOM_LEFT > LED_COUNT_BOTTOM_RIGHT ? LED_COUNT_BOTTOM_LEFT : LED_COUNT_BOTTOM_RIGHT);
+static_assert(LED_MAX_STRIP_PIXELS >= LED_COUNT_COCKPIT_FRONT &&
+              LED_MAX_STRIP_PIXELS >= LED_COUNT_COCKPIT_BACK,
+              "LED_MAX_STRIP_PIXELS must cover the longest strip");
+
 // -------------------- IMU OBJECT --------------------
 // GY-521 MPU6050
 Adafruit_MPU6050 imu;
@@ -299,8 +321,26 @@ static LightingMode g_mode = MODE_NAV_LIGHTS;
 
 // -------------------- BRIGHTNESS STATE --------------------
 // We use discrete brightness levels mapped into [BRIGHTNESS_MIN..BRIGHTNESS_MAX]
+// g_brightnessValue is the REQUESTED brightness. The library's own
+// setBrightness() is never used (it is lossy: it rescales the pixel buffer in
+// place). Pixel buffers hold full-scale colours; the applied brightness is
+// decided by EnforcePowerBudget() and applied only on the way out in
+// ShowAllStrips().
 static uint8_t g_brightnessIndex = 0;      // 0..(BRIGHTNESS_LEVELS-1)
 static uint8_t g_brightnessValue = BRIGHTNESS_DEFAULT;
+
+// -------------------- POWER BUDGET STATE --------------------
+struct PowerBudgetStats {
+  uint16_t litPixels;    // pixels with any channel non-zero (all strips)
+  uint16_t totalPixels;  // all pixels (all strips)
+  float    litFraction;  // litPixels / totalPixels
+  uint8_t  requested;    // g_brightnessValue at evaluation time
+  uint8_t  applied;      // brightness actually sent to the strips
+  float    product;      // litFraction * applied / 255  (must be <= 0.20)
+  bool     limited;      // true if applied < requested
+};
+static PowerBudgetStats g_budget = { 0, LED_TOTAL_PIXELS, 0.0f, 0, 0, 0.0f, false };
+static bool g_budgetFresh = false;  // set by EnforcePowerBudget, consumed by ShowAllStrips
 
 // -------------------- TURN / HAZARD STATE --------------------
 // Hold-to-jog behavior will use PB3/PB4 states directly,
@@ -379,16 +419,88 @@ static void ClearAllStrips() {
   }
 }
 
-static void ShowAllStrips() {
+// -------------------- LED POWER BUDGET --------------------
+// HARD SAFETY CONSTRAINT. Walks every pixel of every strip, counts pixels
+// with any non-zero channel, and limits the applied brightness so that
+//   litFraction * (applied / 255) <= LED_POWER_BUDGET_MAX.
+// Brightness is scaled down; pixels are never turned off. Must be called
+// immediately before ShowAllStrips() every frame (ShowAllStrips enforces it
+// anyway if a caller forgets).
+static void EnforcePowerBudget() {
+  uint32_t lit = 0;
+  uint32_t total = 0;
+
   for (uint8_t si = 0; si < LED_STRIP_COUNT; si++) {
-    LED_STRIPS[si]->show();
+    Adafruit_NeoPixel *s = LED_STRIPS[si];
+    const uint8_t *px = s->getPixels();
+    const uint16_t n = s->numPixels();
+    total += n;
+    if (px == nullptr) continue;  // begin()/alloc failed: nothing can be shown
+    for (uint16_t i = 0; i < n; i++) {
+      const uint8_t *p = px + (uint32_t)i * LED_BYTES_PER_PIXEL;
+      uint8_t any = 0;
+      for (uint8_t c = 0; c < LED_BYTES_PER_PIXEL; c++) any |= p[c];
+      if (any) lit++;
+    }
   }
+
+  const float litFraction = (total > 0) ? ((float)lit / (float)total) : 0.0f;
+  const uint8_t requested = g_brightnessValue;
+  uint8_t applied = requested;
+
+  if (litFraction > 0.0f) {
+    const float maxB = (LED_POWER_BUDGET_MAX * 255.0f) / litFraction;
+    if ((float)applied > maxB) applied = (uint8_t)maxB;   // floor
+    // Guard against float rounding: step down until it provably passes.
+    while (applied > 0 &&
+           (litFraction * ((float)applied / 255.0f)) > LED_POWER_BUDGET_MAX) {
+      applied--;
+    }
+  }
+
+  g_budget.litPixels   = (uint16_t)lit;
+  g_budget.totalPixels = (uint16_t)total;
+  g_budget.litFraction = litFraction;
+  g_budget.requested   = requested;
+  g_budget.applied     = applied;
+  g_budget.product     = litFraction * ((float)applied / 255.0f);
+  g_budget.limited     = (applied < requested);
+  g_budgetFresh = true;
 }
 
-static void SetBrightnessAll(uint8_t b) {
+// Scratch copy so brightness scaling is lossless: the render buffers always
+// keep full-scale colours, the scaled copy only exists while show() runs.
+static uint8_t g_showScratch[(uint32_t)LED_MAX_STRIP_PIXELS * 4];
+
+static void ShowAllStrips() {
+  // Defence in depth: nothing reaches the strips without a budget check
+  // computed from the current buffers.
+  if (!g_budgetFresh) EnforcePowerBudget();
+
+  const uint16_t scale = (uint16_t)g_budget.applied + 1;  // 1..256, same math as the library
+
   for (uint8_t si = 0; si < LED_STRIP_COUNT; si++) {
-    LED_STRIPS[si]->setBrightness(b);
+    Adafruit_NeoPixel *s = LED_STRIPS[si];
+    uint8_t *px = s->getPixels();
+    if (px == nullptr) continue;
+    const uint32_t nBytes = (uint32_t)s->numPixels() * LED_BYTES_PER_PIXEL;
+    if (nBytes > sizeof(g_showScratch)) continue;  // cannot happen (static_assert above)
+
+    memcpy(g_showScratch, px, nBytes);
+    for (uint32_t i = 0; i < nBytes; i++) {
+      px[i] = (uint8_t)(((uint16_t)px[i] * scale) >> 8);
+    }
+    s->show();                       // blocking: RMT transmit completes before return
+    memcpy(px, g_showScratch, nBytes);
   }
+
+  g_budgetFresh = false;
+}
+
+// Sets the REQUESTED brightness for all strips. The applied value is decided
+// per frame by EnforcePowerBudget().
+static void SetBrightnessAll(uint8_t b) {
+  g_brightnessValue = b;
 }
 
 static uint8_t BrightnessFromIndex(uint8_t idx) {
@@ -401,8 +513,7 @@ static uint8_t BrightnessFromIndex(uint8_t idx) {
 }
 
 static void ApplyBrightnessFromIndex() {
-  g_brightnessValue = BrightnessFromIndex(g_brightnessIndex);
-  SetBrightnessAll(g_brightnessValue);
+  SetBrightnessAll(BrightnessFromIndex(g_brightnessIndex));
 }
 
 // -------------------- PWM HELPER (AUX OUTPUT) --------------------
@@ -892,6 +1003,30 @@ static void UpdateSteppersJog() {
 // ============================================================================
 
 void setup() {
+  // -------------------- SAFE OUTPUT STATE FIRST --------------------
+  // Order matters: drivers disabled, strips dark, light bars at 0 -- before
+  // anything that can take time or fail (USB, I2C, UART).
+
+  // Stepper drivers: ~{EN} HIGH = disabled (see STEPPER DRIVER ENABLES below)
+  digitalWrite(PIN_UPDOWN_EN, HIGH);
+  digitalWrite(PIN_LEFTRIGHT_EN, HIGH);
+  pinMode(PIN_UPDOWN_EN, OUTPUT);
+  pinMode(PIN_LEFTRIGHT_EN, OUTPUT);
+
+  // LED strips: all dark (render buffers zeroed, budget-checked, shown)
+  stripBottomLeft.begin();
+  stripBottomRight.begin();
+  stripCockpitFront.begin();
+  stripCockpitBack.begin();
+  ClearAllStrips();
+  SetBrightnessAll(BRIGHTNESS_DEFAULT);
+  EnforcePowerBudget();
+  ShowAllStrips();
+
+  // Light-bar PWM at 0
+  pinMode(PIN_PWM_DATA, OUTPUT);
+  SetAuxPwmDuty(0);
+
   // -------------------- CORE --------------------
   Serial.begin(115200);
   delay(STARTUP_DELAY_MS);   // allow power rails + level shifter to settle
@@ -902,19 +1037,11 @@ void setup() {
   pinMode(PIN_PB_TURN_LEFT,  INPUT_PULLUP);
   pinMode(PIN_PB_TURN_RIGHT, INPUT_PULLUP);
 
-  // -------------------- PWM OUTPUT --------------------
-  pinMode(PIN_PWM_DATA, OUTPUT);
-  SetAuxPwmDuty(0);          // ensure auxiliary output is off
-
   // -------------------- STEPPER DRIVER ENABLES --------------------
-  // ~{EN} is active-LOW. SAFE POWER-ON: drivers stay DISABLED (HIGH) until
-  // UART configuration has succeeded (Phase 2). Without UART config the
-  // current is set by the module's VREF trimpot, not by firmware.
-  // Write the level BEFORE switching to OUTPUT so there is no LOW glitch.
-  digitalWrite(PIN_UPDOWN_EN, HIGH);
-  digitalWrite(PIN_LEFTRIGHT_EN, HIGH);
-  pinMode(PIN_UPDOWN_EN, OUTPUT);
-  pinMode(PIN_LEFTRIGHT_EN, OUTPUT);
+  // ~{EN} is active-LOW and was driven HIGH (disabled) at the top of setup().
+  // SAFE POWER-ON: drivers stay disabled until UART configuration has
+  // succeeded. Without UART config the current is set by the module's VREF
+  // trimpot, not by firmware.
 
   // Configure stepper motion limits
   stepperUpDown.setMaxSpeed(STEPPER_MAX_SPEED);
@@ -925,17 +1052,6 @@ void setup() {
 
   // Establish known starting positions (logical 0)
   InitStepperState();
-
-  // -------------------- LED STRIPS --------------------
-  stripBottomLeft.begin();
-  stripBottomRight.begin();
-  stripCockpitFront.begin();
-  stripCockpitBack.begin();
-
-  // Start dark (important for 12V systems)
-  ClearAllStrips();
-  SetBrightnessAll(BRIGHTNESS_DEFAULT);
-  ShowAllStrips();
 
   // -------------------- IMU (MPU6050) --------------------
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
@@ -958,6 +1074,7 @@ void setup() {
 
   // Render initial mode
   RenderNavLights();
+  EnforcePowerBudget();
   ShowAllStrips();
 
   Serial.println("Setup complete");
@@ -1024,7 +1141,9 @@ void loop() {
     ApplyTurnHazardOverlay(nowMs);
   }
 
-  // Push pixels out
+  // Power budget from the actual pixel buffers, then push pixels out.
+  // HARD SAFETY CONSTRAINT: nothing may sit between these two calls.
+  EnforcePowerBudget();
   ShowAllStrips();
 
   // -------------------- 4) STEPPER UPDATE --------------------
