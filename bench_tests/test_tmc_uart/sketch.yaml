@@ -1,0 +1,1 @@
+default_fqbn: arduino:esp32:nano_nora:PinNumbers=byGPIONumber
