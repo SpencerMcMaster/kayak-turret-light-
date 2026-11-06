@@ -13,6 +13,7 @@ Work top to bottom. Do not start a stage until the previous one passes.
 | 5 | `test_led_strip`, `TEST_STRIP` 0–3 | `kayak_working` budget checks |
 | 6 | `test_lightbar` | `kayak_working` lift-gated light bars |
 | 7–8 | — | `kayak_working` IMU / tracking |
+
 **Never plug or unplug a stepper motor while 12 V is on** (TMC2209 output stage damage).
 
 ---
@@ -23,7 +24,7 @@ Work top to bottom. Do not start a stage until the previous one passes.
 |---|---|---|---|
 | 1 | **TMC UART wiring: D1/TX reaches nothing on factory modules** | Stage 3 green LED, all motion | See [Open item 1](#open-item-1--tmc2209-uart-tx-path-r10) |
 | 2 | **GY-521 I²C pull-up rail** (3.3 V or 5 V?) | Stage 2 (before the Nano is fitted) | Measure in Stage 2, step 2.4 |
-| 3 | **Level shifter part**: netlist value says `74HC245`, build uses SN74HCT245N | Stage 6 strips | Read the chip marking. It must say **HCT**. An HC part at 5 V needs VIH ≥ 3.5 V, and 3.3 V drive is out of spec |
+| 3 | **Level shifter part**: netlist value says `74HC245`, build uses SN74HCT245N | Stage 5 strips | Read the chip marking. It must say **HCT**. An HC part at 5 V needs VIH ≥ 3.5 V, and 3.3 V drive is out of spec |
 | 4 | **Unidentified pot-like part on the TMC2209 module** | Nothing (UART mode ignores it). See note | See [Open item 4](#open-item-4--the-pot-like-part-on-the-tmc2209-v13) |
 | 5 | **No homing yet**: pan must be at full LEFT and lift at full DOWN at power-on | Stage 4 soft limits | Position by hand before every power-on until StallGuard homing is tuned |
 | 6 | **Outputs float before `setup()`** (ROM bootloader + ~0.9 s core double-tap fade): LED data inputs on U1 and D8 are undriven | Board revision | See [Board revision items](#board-revision-items) |
